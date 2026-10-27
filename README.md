@@ -1,6 +1,6 @@
 # TESmart HDK403-P23 ESP32 Controller
 
-ESP32 firmware for controlling a TESmart HDK403-P23 (4 PCs × 3 monitors) KVM over the network. The ESP32 connects to the KVM's UART service port. It provides a web page for everyday switching and an HTTP API for tools such as [Bitfocus Companion](https://bitfocus.io/companion).
+ESP32 firmware for controlling a TESmart HDK403-P23 (4 PCs × 3 monitors) KVM over the network. It will likely work with other TESmart models too (see [Compatibility](#compatibility)). The ESP32 connects to the KVM's UART service port. It provides a web page for everyday switching and an HTTP API for tools such as [Bitfocus Companion](https://bitfocus.io/companion).
 
 Features:
 
@@ -11,6 +11,31 @@ Features:
 - Firmware updates over Wi-Fi after the first USB flash
 - Settings export, import and factory reset
 - Serial tools for working with the KVM protocol: raw hex sender, baud setting, live log
+
+## Compatibility
+
+This firmware was developed and tested on the HDK403-P23. It will likely work with other TESmart KVMs that have a UART service port, since they appear to share the same `AA BB …` command family. TESmart's manual for a 2-PC triple-monitor model documents the same switch commands. Check these differences before relying on it:
+
+- **Baud rate:** the HDK403-P23 uses 9600, but the 2-PC model's manual says 38400. Change it on the Advanced page.
+- **Frame ending:** the HDK403-P23 needs a checksum as the last byte. The manual shows a fixed `EE` instead. The firmware always sends the checksum. If your model only accepts `EE`, change the last byte in `sendKvm()` in `src/main.cpp`.
+- **Number of PCs and outputs:** the page offers 4 PCs and 3 outputs. On a model with fewer, the extra buttons do nothing.
+- **Front-panel reports:** these may differ or be missing, which would leave the page's routing display stale after a front-panel change.
+
+To check a new model, use the Advanced page:
+
+1. Try each baud rate and watch the serial log while you press a front-panel input button. Clean frames starting `AA BB` mean the rate is right.
+2. Send a switch command with and without **Add checksum byte**, for example `AA BB 03 01 01`, and see whether the KVM switches.
+
+The [protocol notes](#hdk403-p23-serial-protocol-as-observed) below show what to compare against.
+
+If your model behaves differently, please [open an issue](https://github.com/LKHetzel/smart-kvm-esp32/issues). Include:
+
+- the model number
+- the baud rate that works
+- whether commands need the checksum or `EE`
+- the frames from the serial log when you press front-panel buttons
+
+We'll add support for it as a build-time option: a separate PlatformIO environment in `platformio.ini`, selected with `pio run -e <model>`. That way each model gets the right messaging without code changes. Reports from models that work as-is are welcome too, so they can be listed here.
 
 ## Hardware
 
@@ -44,9 +69,11 @@ You can use PlatformIO two ways:
 
 ### 1. Configure
 
-Copy the secrets template:
+Clone the repository and copy the secrets template:
 
 ```bash
+git clone https://github.com/LKHetzel/smart-kvm-esp32.git
+cd smart-kvm-esp32
 cp include/secrets.example.h include/secrets.h
 ```
 
