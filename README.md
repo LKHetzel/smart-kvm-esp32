@@ -1,123 +1,228 @@
 # TESmart HDK403-P23 ESP32 Controller
 
-Small ESP32 network-to-UART controller for a TESmart HDK403-P23 matrix KVM.
+ESP32 firmware for controlling a TESmart HDK403-P23 (4 PCs × 3 monitors) KVM over the network. The ESP32 connects to the KVM's UART service port. It provides a web page for everyday switching and an HTTP API for tools such as [Bitfocus Companion](https://bitfocus.io/companion).
 
-## Wiring
+Features:
 
-TESmart 3.5 mm TRRS service/UART port:
+- Switch any output to any of the four PCs, or switch all outputs at once
+- Named PCs and up to 8 custom presets, set up from the web page
+- Front-panel input changes are picked up and shown on the page
+- Separate login for the web page and bearer token for the API
+- Firmware updates over Wi-Fi after the first USB flash
+- Settings export, import and factory reset
+- Serial tools for working with the KVM protocol: raw hex sender, baud setting, live log
 
-- Tip: VCC 3.3 V — leave disconnected
-- Ring 1: KVM_TX — connect to ESP32 GPIO16 (RX)
-- Ring 2: KVM_RX — connect to ESP32 GPIO17 (TX)
-- Sleeve: GND — connect to ESP32 GND
+## Hardware
 
-UART: 3.3 V TTL, 9600 baud, 8N1 (confirmed on the HDK403-P23; the 2-PC model's manual says 38400).
+- An ESP32 dev board. The project targets the generic `esp32dev` (ESP32-WROOM-32) board.
+- A 3.5 mm TRRS breakout or terminal adapter for the KVM's service port
+- Three jumper wires, plus a USB cable for the first flash
 
-Do **not** use RS-232 voltage levels and do not connect the TRRS 3.3 V tip to the ESP32 3.3 V rail.
+### Wiring
 
-## HDK403-P23 serial protocol (as observed)
+The KVM's 3.5 mm TRRS service port carries 3.3 V TTL serial:
 
-The TESmart manual for the 2-PC model doesn't match this unit. Here's what has been confirmed on the HDK403-P23:
+| TRRS contact | KVM signal | Connect to |
+|---|---|---|
+| Tip | VCC 3.3 V | **Leave disconnected** |
+| Ring 1 | KVM TX | ESP32 GPIO16 (RX) |
+| Ring 2 | KVM RX | ESP32 GPIO17 (TX) |
+| Sleeve | GND | ESP32 GND |
 
-- 9600 baud, 8N1
-- Frames are `AA BB <type> <arg1> <arg2> <checksum>`. The checksum is the low byte of the sum of the first five bytes. Frames that end in `EE`, as the manual shows, are ignored.
-- `AA BB 03 <output> <pc> <sum>` switches outputs. `output` is 1–3, or `00` for all outputs, and `pc` counts from 0, so `00` is PC1. Confirmed for each output with PC1 and PC2, and for all outputs with all four PCs. Switching a single output to PC3 or PC4 hasn't been tested yet.
-- The KVM sends `AA BB 82 01 <pc> <sum>` when an input button on the front panel is pressed. `pc` counts from 0, and all four inputs are confirmed. The controller uses it to update its state, and the web page shows the change at its next refresh, within 10 seconds. The KVM sometimes sends the same report in response to the controller's own commands, so reports arriving within 1 second of a switch command are ignored.
-- The status query (`06 02 03`) has never received a reply.
-- The buzzer toggle from the manual (`04 02 xx`) does nothing on this model, so the firmware doesn't offer it.
+Don't use RS-232 voltage levels, and don't connect the TRRS tip to the ESP32's 3.3 V rail. Power the ESP32 from its own USB supply.
 
-## PC names and presets
+To use different pins, change `KVM_TX_PIN` and `KVM_RX_PIN` in `src/main.cpp`.
 
-You can rename PC1–PC4 and build up to 8 presets on the Advanced page. Each preset sets each output to one of the four PCs, or leaves it Unchanged. Both are saved on the controller and survive restarts and firmware updates. A new controller starts with no presets and the names `PC1`–`PC4`.
+## Building and flashing
 
-## Build
+This project is best used with [PlatformIO](https://platformio.org/). It relies on PlatformIO features: `board_build.embed_txtfiles` to build the web pages into the firmware, and the `include/` folder for secrets. It won't build as-is in the Arduino IDE.
 
-Copy the secrets template and fill in your Wi-Fi settings, API token and web login (`include/secrets.h` is gitignored):
+You can use PlatformIO two ways:
+
+- **VS Code:** install the [PlatformIO IDE extension](https://platformio.org/install/ide?install=vscode), then open this folder. The extension installs the toolchain on first use.
+- **Command line:** install [PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/index.html), for example with `pipx install platformio`, to get the `pio` command.
+
+### 1. Configure
+
+Copy the secrets template:
 
 ```bash
 cp include/secrets.example.h include/secrets.h
-pio run -t upload
-pio device monitor
 ```
 
-Default hostname: `kvm-controller.local` (set `HOSTNAME` in `src/main.cpp`)
+Edit `include/secrets.h`. It's gitignored, so your credentials stay out of version control.
 
-If Wi-Fi can't connect within 30 seconds of boot, the ESP32 restarts and tries again.
+| Setting | Purpose |
+|---|---|
+| `WIFI_SSID`, `WIFI_PASSWORD` | Your 2.4 GHz Wi-Fi network |
+| `API_TOKEN` | Bearer token for `/api/*`. Generate one with `openssl rand -hex 16`. Leaving it blank or as `CHANGE_ME_TOKEN` **turns off API authentication**. |
+| `UI_USERNAME`, `UI_PASSWORD` | Login for the web page. Change the placeholder password. Leaving it blank turns off the login. |
 
-The first flash must be over USB. After that you can upload `.pio/build/esp32dev/firmware.bin` from the Advanced page. Bump `FW_VERSION` in `src/main.cpp` for each release, so the page shows which build is running.
+Optional settings at the top of `src/main.cpp`:
 
-Project layout:
+| Setting | Default | Purpose |
+|---|---|---|
+| `HOSTNAME` | `kvm-controller` | mDNS name (`kvm-controller.local`) and Wi-Fi hostname |
+| `FW_VERSION` | | Shown on the web page. Bump it for each release. |
+| `DEFAULT_KVM_BAUD` | `9600` | Used until a different rate is saved from the Advanced page |
+| `KVM_TX_PIN`, `KVM_RX_PIN` | `17`, `16` | UART pins |
 
-- `src/main.cpp`: firmware
-- `web/`: the built-in pages (`index.html`, `advanced.html`, shared `app.css` and `app.js`). They're embedded into the firmware through `board_build.embed_txtfiles` in `platformio.ini`, so a normal build or firmware upload includes them.
-- `include/secrets.h`: credentials (gitignored)
+### 2. First flash (USB)
 
-## Web interface
+Connect the ESP32 over USB, then:
 
-Open `http://kvm-controller.local/`. The browser asks for the web login (`UI_USERNAME` / `UI_PASSWORD` in `secrets.h`) once and remembers it. The page doesn't use the API token. It calls the `/ui/*` endpoints, which take the same login. Leave `UI_PASSWORD` blank to turn the login off.
+```bash
+pio run -t upload      # build and flash
+pio device monitor     # watch the serial log (Ctrl+C to exit)
+```
 
-`/advanced` has tools for bring-up and maintenance:
+In VS Code, use the **Upload** (→) and **Serial Monitor** (plug icon) buttons on the PlatformIO status bar.
 
-- **KVM serial:** set the baud rate (applied immediately and saved on the controller), send raw hex such as `AA BB 03 01 00 EE`, and run the status query.
-- **Serial log:** the last 40 transmit/receive entries, including any bytes the KVM sends by itself. It updates every second.
-- **Firmware update:** upload a new `firmware.bin` over Wi-Fi.
+The serial log shows the IP address once Wi-Fi connects:
+
+```text
+WiFi connected: 192.168.1.50
+mDNS: http://kvm-controller.local/
+TESmart ESP32 controller v0.7.0 (...) ready, KVM serial 9600 baud
+```
+
+If Wi-Fi can't connect within 30 seconds, the ESP32 restarts and tries again.
+
+On Linux, if the upload can't open the serial port, add yourself to the serial group and log in again. That's `dialout` on Debian/Ubuntu and `uucp` on Arch.
+
+### 3. Later updates (over Wi-Fi)
+
+Build without flashing:
+
+```bash
+pio run
+```
+
+Then open **Advanced → Firmware update** on the web page and upload `.pio/build/esp32dev/firmware.bin`. The controller installs it and restarts. The page reloads when it's back. Names, presets and other settings are kept.
+
+## Using it
+
+### Web page
+
+Open `http://kvm-controller.local/`, or use the IP address if your network doesn't resolve `.local` names. The browser asks for the web login once and remembers it.
+
+The main page has:
+
+- **Presets:** one button per saved preset. The button matching the current routing is highlighted.
+- **All → PC:** switch every output to one PC.
+- **Outputs:** switch each of the three outputs on its own. The current PC is highlighted.
+
+The routing display refreshes every 10 seconds.
+
+### Advanced page
+
+Open it with the **Advanced** button at the bottom of the main page.
+
+- **PC names:** rename PC1–PC4. The names appear on every button.
+- **Presets:** add, edit and delete up to 8 presets. Each sets every output to a PC, or leaves it unchanged.
 - **Backup & reset:**
-  - **Export:** downloads a settings file with the PC names, presets and baud rate.
-  - **Import:** loads such a file and replaces all three.
-  - **Factory reset:** erases every saved setting and restarts.
+  - **Export:** downloads the PC names, presets and baud rate as a JSON file.
+  - **Import:** restores such a file.
+  - **Factory reset:** erases all saved settings and restarts.
 
-  None of these touch the Wi-Fi details, API token or web login, which are compiled into the firmware.
+  None of these touch the Wi-Fi details, API token or web login, because those are built into the firmware.
+- **KVM serial:** change the baud rate, send raw hex (with the checksum added automatically, if you choose), and run the status query.
+- **Serial log:** the last 40 frames sent and received, updated every second.
+- **Firmware update:** see [Later updates](#3-later-updates-over-wi-fi).
 
-`POST /ui/*` requests must also send an `X-Requested-With` header. Browsers won't add that header to a request from another site, so other websites can't use your saved login to switch the KVM.
+A new controller starts with no presets and the names PC1–PC4.
 
 ## API
 
-External clients (Companion etc.) use `/api/*`. If `API_TOKEN` is configured, send:
+External tools use `/api/*` with the bearer token:
 
 ```text
 Authorization: Bearer YOUR_TOKEN
 ```
 
-Every endpoint below also exists under `/ui/...` for the built-in page. Those use the web login instead of the token.
+| Endpoint | Action |
+|---|---|
+| `GET /health` | Liveness check, no auth |
+| `GET /api/status` | Current state, as shown below |
+| `POST /api/preset/<n>` | Apply preset `n`, numbered from 1 in the order shown on the Advanced page |
+| `POST /api/all/pc<1-4>` | Switch every output to one PC |
+| `POST /api/output/<1-3>/pc/<1-4>` | Switch one output |
+| `POST /api/query` | Send the manual's status query and return any raw reply as hex. The HDK403-P23 hasn't answered it. |
 
-Endpoints:
+Responses:
 
-- `GET /health` (no auth)
-- `GET /api/status`
-- `POST /api/preset/<n>`: apply preset number `n`, counting from 1 in the order shown on the Advanced page
-- `POST /api/all/pc<1-4>`: switch every output to one PC
-- `POST /api/output/<1-3>/pc/<1-4>`: switch one output
-- `POST /api/query`
+```json
+{"ok":true,"action":"preset-1","state":{
+  "version":"0.7.0","build":"...","uptime":1234,"hostname":"kvm-controller","ip":"192.168.1.50","rssi":-60,
+  "pcs":["PC1","PC2","PC3","PC4"],
+  "presets":[{"name":"My preset","outputs":[1,1,2]}],
+  "outputs":{"1":1,"2":1,"3":2}}}
+```
 
-Responses look like `{"ok":true,"action":"preset-1","state":{"version":...,"build":...,"uptime":<seconds>,"hostname":...,"ip":...,"rssi":...,"pcs":["PC1","PC2"],"presets":[{"name":"My preset","outputs":[1,1,2]},...],"outputs":{"1":1,"2":1,"3":2}}}`; `/api/status` returns `{"ok":true,"state":{...}}`. Output values: 0 unknown, otherwise the PC number (1–4).
+`/api/status` returns `{"ok":true,"state":{...}}`. In `outputs`, `0` means unknown. Otherwise the value is the PC number. In a preset's `outputs`, `0` means "leave unchanged". Errors return `{"ok":false,"error":"..."}` with a 4xx or 5xx status.
 
-Traffic is plain HTTP, so the token and the web login are visible on the network. Keep the device on a trusted LAN.
+Deleting a preset renumbers the presets after it, so update any Companion buttons that point at those numbers.
 
-These exist only under `/ui/*`, with the web login, and aren't exposed to `/api` clients:
+### Companion
 
-- `POST /ui/config/pcs` with form fields `pc1`–`pc4`. A blank name resets to the default (`PC1` and so on).
-- `POST /ui/config/preset/save` with form fields `index` (0 for a new preset), `name`, `o1`, `o2`, `o3`. Each output is 0 for unchanged, or a PC number from 1 to 4.
-- `POST /ui/config/preset/delete` with form field `index`
-- `GET /ui/config/export`: settings as a JSON file download
-- `POST /ui/config/import` with form fields `baud`, `pc1`–`pc4`, `presets` (the count), then `p<n>name` and `p<n>o1`–`p<n>o3` for each preset. The Advanced page converts an exported file into these fields. Everything is validated before anything is saved.
-- `POST /ui/config/reset`: factory reset. It erases the names, presets, baud rate and routing state, then restarts.
+Use the Generic HTTP module's POST action, with the `Authorization` header shown above:
 
-- `POST /ui/serial/send` with form field `hex=AA BB ...` (up to 64 bytes). Returns the bytes sent and any reply received within 120 ms.
-- `POST /ui/serial/baud` with form field `baud=` set to 9600, 19200, 38400, 57600 or 115200
-- `GET /ui/serial/log?since=<id>`: log entries newer than `id`
-- `POST /ui/update`: multipart firmware upload. The controller restarts once the update is installed.
+- `http://kvm-controller.local/api/preset/1`
+- `http://kvm-controller.local/api/all/pc2`
+- `http://kvm-controller.local/api/output/3/pc/1`
 
-The `/api/query` endpoint sends the TESmart manual's connection-status query and returns the raw response bytes as hex. The HDK403-P23 hasn't replied to it so far.
+### Web page endpoints
 
-## Companion
+The built-in pages use `/ui/*` with the web login instead of the token. Every `/api` endpoint above also exists under `/ui`. These exist only under `/ui`:
 
-Use Generic HTTP actions:
+| Endpoint | Form fields |
+|---|---|
+| `POST /ui/config/pcs` | `pc1`–`pc4`. A blank name resets to the default. |
+| `POST /ui/config/preset/save` | `index` (0 for new), `name`, `o1`–`o3` (0–4) |
+| `POST /ui/config/preset/delete` | `index` |
+| `GET /ui/config/export` | Downloads the settings JSON |
+| `POST /ui/config/import` | `baud`, `pc1`–`pc4`, `presets` (the count), then `p<n>name` and `p<n>o1`–`p<n>o3` for each preset. All fields are validated before anything is saved. |
+| `POST /ui/config/reset` | None. Factory reset, then restart. |
+| `POST /ui/serial/send` | `hex` (up to 64 bytes) and `checksum=1` to append the checksum. Returns any reply received within 120 ms. |
+| `POST /ui/serial/baud` | `baud`: 9600, 19200, 38400, 57600 or 115200 |
+| `GET /ui/serial/log?since=<id>` | None. Returns log entries newer than `id`. |
+| `POST /ui/update` | Multipart firmware upload |
 
-- First preset: `POST http://kvm-controller.local/api/preset/1`
-- Second preset: `POST http://kvm-controller.local/api/preset/2`
+`POST /ui/*` requests must include an `X-Requested-With` header. Browsers won't add that header to a request from another site, so other websites can't use your saved login.
 
-Use the same Bearer token header if authentication is enabled.
+## Security
 
-## State
+- Traffic is plain HTTP, so the token and web login can be read by anyone watching the network. Keep the controller on a trusted LAN or VLAN, and don't expose it to the internet.
+- The API token only allows switching, status and the status query. Configuration, serial tools and firmware updates need the web login.
 
-The firmware remembers the last routes it commanded in ESP32 NVS. This is controller-side state, not authoritative KVM readback. Front-panel input buttons send a report that the controller picks up. Changes made from the remote or keyboard hotkeys haven't been tested, and may leave `/api/status` stale.
+## Routing state
+
+The controller doesn't read the routing back from the KVM. The status query never gets an answer. Instead it tracks state from two sources:
+
+- **Its own commands:** every switch it sends updates the state.
+- **Front-panel reports:** the KVM reports input button presses, and the controller picks them up.
+
+Changes made with the IR remote or keyboard hotkeys haven't been tested, and may not be reported. Until the next switch, the page may show stale routing after such a change. State is saved in flash, so it survives restarts. A factory reset clears it.
+
+## HDK403-P23 serial protocol (as observed)
+
+TESmart's published UART table for its 2-PC model doesn't match the HDK403-P23. Here's what has been confirmed on this unit:
+
+- 9600 baud, 8N1
+- Frames are `AA BB <type> <arg1> <arg2> <checksum>`. The checksum is the low byte of the sum of the first five bytes. Frames ending in `EE`, as the manual shows, are ignored.
+- **Switching:** `AA BB 03 <output> <pc> <sum>`. `output` is 1–3, or `00` for all outputs. `pc` counts from 0, so `00` is PC1. Confirmed for each output with PC1 and PC2, and for all outputs with all four PCs. A single output to PC3 or PC4 hasn't been tested yet.
+- **Front-panel report:** the KVM sends `AA BB 82 01 <pc> <sum>` when an input button is pressed. Confirmed for all four inputs. It sometimes sends the same frame in response to a switch command, so the firmware ignores reports for 1 second after sending a switch.
+- **Not working:** the status query (`06 02 03`) never gets a reply. The buzzer toggle (`04 02 xx`) does nothing, and changing the buzzer setting in the KVM's menu sends nothing over serial.
+
+## Project layout
+
+```text
+platformio.ini            Board, framework and embedded web files
+include/secrets.example.h Template for include/secrets.h (gitignored)
+src/main.cpp              Firmware
+web/index.html            Main page
+web/advanced.html         Advanced page
+web/app.css, web/app.js   Shared styles and helpers
+```
+
+The files in `web/` are embedded into the firmware at build time, so changing a page only needs a rebuild and upload.
