@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TESmart KVM · Advanced</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body><main>
+<header><h1>Advanced</h1><span class="badge" id="ver">v…</span></header>
+<p><a class="button" href="/">← Back to controls</a></p>
+
+<h2>PC names</h2>
+<div class="field"><label for="pc1">PC1</label><input id="pc1" maxlength="24"></div>
+<div class="field"><label for="pc2">PC2</label><input id="pc2" maxlength="24"></div>
+<div class="field"><label for="pc3">PC3</label><input id="pc3" maxlength="24"></div>
+<div class="field"><label for="pc4">PC4</label><input id="pc4" maxlength="24"></div>
+<p><button onclick="savePcNames()">Save names</button></p>
+
+<h2>Presets</h2>
+<div id="presetList"></div>
+<p><button onclick="$('presetList').append(presetCard({name: '', outputs: [0, 0, 0]}, 0))">Add preset</button></p>
+<p class="note">"Unchanged" leaves that output where it is. You can have up to 8 presets. Companion can trigger them with <code>POST /api/preset/&lt;number&gt;</code>, numbered from 1 in this order.</p>
+
+<p id="msg"></p>
+
+<h2>Backup &amp; reset</h2>
+<p><a class="button" href="/ui/config/export" download>Export settings</a></p>
+<div class="field">
+  <input type="file" id="importFile" accept=".json,application/json">
+  <button onclick="importSettings()">Import</button>
+</div>
+<p><button onclick="factoryReset()">Factory reset</button></p>
+<p class="note">The settings file holds the PC names, presets and baud rate. Importing one replaces all of them. Factory reset erases every saved setting and restarts the controller. Neither one touches the Wi-Fi details, API token or web login, which are built into the firmware.</p>
+
+<h2>KVM serial</h2>
+<div class="field">
+  <label for="baud">Baud rate</label>
+  <select id="baud">
+    <option>9600</option><option>19200</option><option>38400</option><option>57600</option><option>115200</option>
+  </select>
+  <button onclick="setBaud()">Apply</button>
+</div>
+<div class="field">
+  <input id="hex" placeholder="AA BB 03 01 00" spellcheck="false" autocomplete="off" onkeydown="if (event.key === 'Enter') sendHex()">
+  <button onclick="sendHex()">Send</button>
+</div>
+<div class="field"><label><input type="checkbox" id="addSum" checked> Add checksum byte</label></div>
+<div class="grid">
+  <button onclick="act('/ui/query')">Query status</button>
+</div>
+<p class="note">The baud rate is saved on the controller. With "Add checksum byte" ticked, the KVM's checksum (the low byte of the sum of all bytes) is added to the end. For example, <code>AA BB 03 01 01</code> becomes <code>AA BB 03 01 01 6A</code>. Replies, and anything the KVM sends by itself, show up in the log. The status query is from the manual, and this KVM hasn't answered it yet.</p>
+
+<h2>Serial log</h2>
+<pre id="log"></pre>
+<p><button class="small" onclick="$('log').textContent = ''">Clear</button></p>
+
+<h2>Firmware update</h2>
+<div class="field">
+  <input type="file" id="fw" accept=".bin">
+  <button onclick="upload()">Upload</button>
+</div>
+<progress id="prog" max="100" value="0" hidden></progress>
+<p class="note">Upload <code>.pio/build/esp32dev/firmware.bin</code>. The controller restarts once it's installed.</p>
+
+<footer id="info">Loading…</footer>
+
+<script src="/app.js"></script>
+<script>
+let cfg = null;
+
+function loadConfig(st) {
+  cfg = st;
+  st.pcs.forEach((n, i) => $('pc' + (i + 1)).value = n);
+  $('presetList').replaceChildren(...st.presets.map((p, i) => presetCard(p, i + 1)));
+}
+
+// index is the preset's 1-based number, or 0 for a new one that hasn't been saved yet.
+function presetCard(p, index) {
+  const name = el('input', {value: p.name, maxLength: 24, placeholder: 'Preset name'});
+  const selects = [0, 1, 2].map(o => {
+    const s = el('select', {}, ...['Unchanged', ...cfg.pcs].map((label, v) => el('option', {value: v, textContent: label})));
+    s.value = p.outputs[o];
+    return s;
+  });
+  const card = el('div', {className: 'card'},
+    el('div', {className: 'field'}, name),
+    ...selects.map((s, o) => el('div', {className: 'field'}, el('label', {textContent: 'Output ' + (o + 1)}), s)),
+    el('div', {className: 'actions'},
+      el('button', {textContent: 'Save', onclick: () => savePreset(index, name.value, selects.map(s => s.value))}),
+      index ? el('button', {textContent: 'Delete', onclick: () => deletePreset(index, p.name)})
+            : el('button', {textContent: 'Cancel', onclick: () => card.remove()})));
+  return card;
+}
+
+function savePcNames() {
+  return busy(async () => {
+    const j = await req('/ui/config/pcs', 'POST', new URLSearchParams([1, 2, 3, 4].map(n => ['pc' + n, $('pc' + n).value])));
+    loadConfig(j.state);
+    say('Names saved', true);
+  });
+}
+
+function savePreset(index, name, outs) {
+  return busy(async () => {
+    const j = await req('/ui/config/preset/save', 'POST',
+                        new URLSearchParams({index, name, o1: outs[0], o2: outs[1], o3: outs[2]}));
+    loadConfig(j.state);
+    say('Preset saved', true);
+  });
+}
+
+function deletePreset(index, name) {
+  if (!confirm(`Delete preset "${name}"?`)) return;
+  return busy(async () => {
+    const j = await req('/ui/config/preset/delete', 'POST', new URLSearchParams({index}));
+    loadConfig(j.state);
+    say('Preset deleted', true);
+  });
+}
+
+async function importSettings() {
+  const f = $('importFile').files[0];
+  if (!f) return say('Choose a settings file first', false);
+  let cfgFile;
+  try { cfgFile = JSON.parse(await f.text()); } catch (e) { return say('Not a valid JSON file', false); }
+  if (cfgFile.type !== 'tesmart-esp32-controller-settings' || !Array.isArray(cfgFile.pcs) || !Array.isArray(cfgFile.presets))
+    return say('Not a settings file exported from this controller', false);
+  if (!confirm(`Replace the current names and presets with the ${cfgFile.presets.length} preset(s) in ${f.name}?`)) return;
+
+  const params = new URLSearchParams({baud: cfgFile.baud, presets: cfgFile.presets.length});
+  cfgFile.pcs.forEach((n, i) => params.set('pc' + (i + 1), n));
+  cfgFile.presets.forEach((p, i) => {
+    params.set(`p${i + 1}name`, p.name);
+    (p.outputs || []).forEach((v, o) => params.set(`p${i + 1}o${o + 1}`, v));
+  });
+  return busy(async () => {
+    const j = await req('/ui/config/import', 'POST', params);
+    loadConfig(j.state);
+    baudLoaded = false;
+    say('Settings imported', true);
+    pollLog();
+  });
+}
+
+function factoryReset() {
+  if (!confirm('Erase all PC names, presets and the baud rate, and restart the controller?')) return;
+  return busy(async () => {
+    await req('/ui/config/reset', 'POST');
+    say('Factory reset done, restarting…', true);
+    waitForRestart();
+  });
+}
+
+let lastId = 0;
+let baudLoaded = false;
+
+async function pollLog() {
+  let j;
+  try { j = await req('/ui/serial/log?since=' + lastId); } catch (e) { return; }
+  if (!baudLoaded) { $('baud').value = j.baud; baudLoaded = true; }
+  const log = $('log');
+  const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+  for (const e of j.entries) {
+    log.textContent += `${(e.t / 1000).toFixed(3).padStart(10)}  ${e.dir}  ${e.hex}\n`;
+    lastId = e.id;
+  }
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+
+function act(url) {
+  return busy(async () => {
+    const j = await req(url, 'POST');
+    say(j.raw !== undefined ? 'Reply: ' + (j.raw || '(none)') : 'Done: ' + j.action, true);
+    pollLog();
+  });
+}
+
+function sendHex() {
+  return busy(async () => {
+    const j = await req('/ui/serial/send', 'POST', new URLSearchParams({hex: $('hex').value, checksum: $('addSum').checked ? 1 : 0}));
+    say(`Sent ${j.sent} · ` + (j.reply ? 'reply ' + j.reply : 'no reply'), true);
+    pollLog();
+  });
+}
+
+function setBaud() {
+  return busy(async () => {
+    const j = await req('/ui/serial/baud', 'POST', new URLSearchParams({baud: $('baud').value}));
+    say('Baud rate set to ' + j.baud, true);
+  });
+}
+
+// XHR rather than fetch so we get upload progress.
+function upload() {
+  const f = $('fw').files[0];
+  if (!f) return say('Choose a .bin file first', false);
+  const fd = new FormData();
+  fd.append('firmware', f, f.name);
+  const x = new XMLHttpRequest();
+  x.open('POST', '/ui/update');
+  x.setRequestHeader('X-Requested-With', 'fetch');
+  const p = $('prog');
+  p.hidden = false; p.value = 0;
+  x.upload.onprogress = e => { if (e.lengthComputable) p.value = e.loaded / e.total * 100; };
+  x.onload = () => {
+    let j = null; try { j = JSON.parse(x.responseText); } catch (e) {}
+    if (x.status === 200 && j && j.ok) { say('Update installed, restarting…', true); waitForRestart(); }
+    else say('Update failed: ' + ((j && j.error) || ('HTTP ' + x.status)), false);
+  };
+  x.onerror = () => say('Upload failed: network error', false);
+  x.send(fd);
+}
+
+async function waitForRestart() {
+  await sleep(3000);
+  for (;;) {
+    try { await req('/ui/status'); location.reload(); return; } catch (e) {}
+    await sleep(1000);
+  }
+}
+
+req('/ui/status').then(j => { renderInfo(j.state); loadConfig(j.state); }).catch(e => say('Status failed: ' + e.message, false));
+pollLog();
+setInterval(pollLog, 1000);
+</script>
+</main></body>
+</html>

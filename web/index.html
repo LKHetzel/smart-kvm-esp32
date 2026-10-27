@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TESmart KVM</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body><main>
+<header><h1>TESmart KVM</h1><span class="badge" id="ver">v…</span></header>
+
+<h2>Presets</h2>
+<div class="grid" id="presets"></div>
+<div class="grid" id="all" style="margin-top:10px"></div>
+
+<h2>Outputs</h2>
+<div id="outputs"></div>
+<p class="note">Shows the last route this controller sent. Changes made at the KVM itself aren't reflected.</p>
+
+<p id="msg"></p>
+
+<p><a class="button" href="/advanced">Advanced</a></p>
+
+<footer id="info">Loading…</footer>
+
+<script src="/app.js"></script>
+<script>
+let builtFor = '';
+
+// Rebuilds the buttons that depend on PC names and presets.
+function build(st) {
+  const pcName = pc => st.pcs[pc - 1];
+  $('presets').replaceChildren(...st.presets.map((p, i) => {
+    const desc = p.outputs.map((pc, o) => pc ? `${o + 1} → ${pcName(pc)}` : null).filter(Boolean).join(', ');
+    return el('button', {className: 'preset', id: 'p' + i, onclick: () => act('/ui/preset/' + (i + 1))},
+              p.name, el('small', {textContent: desc}));
+  }));
+  if (!st.presets.length)
+    $('presets').append(el('p', {className: 'note', textContent: 'No presets yet. Add them on the Advanced page.'}));
+  const pcs = st.pcs.map((_, i) => i + 1);
+  $('all').replaceChildren(...pcs.map(pc =>
+    el('button', {textContent: 'All → ' + pcName(pc), onclick: () => act('/ui/all/pc' + pc)})));
+  $('outputs').replaceChildren(...[1, 2, 3].map(n => el('div', {className: 'row'},
+    el('span', {textContent: 'Output ' + n}),
+    ...pcs.map(pc => el('button', {id: `o${n}p${pc}`, textContent: pcName(pc),
+                                      onclick: () => act(`/ui/output/${n}/pc/${pc}`)})))));
+}
+
+function render(st) {
+  const key = JSON.stringify([st.pcs, st.presets]);
+  if (key !== builtFor) { build(st); builtFor = key; }
+  const o = st.outputs;
+  for (const n of [1, 2, 3]) for (let pc = 1; pc <= st.pcs.length; pc++)
+    $(`o${n}p${pc}`).classList.toggle('active', o[n] === pc);
+  st.presets.forEach((p, i) =>
+    $('p' + i).classList.toggle('active', p.outputs.every((pc, k) => !pc || o[k + 1] === pc)));
+  renderInfo(st);
+}
+
+function act(url) {
+  return busy(async () => {
+    const j = await req(url, 'POST');
+    render(j.state);
+    say('Done: ' + j.action, true);
+  });
+}
+
+async function refresh() {
+  try { render((await req('/ui/status')).state); }
+  catch (e) { say('Status failed: ' + e.message, false); }
+}
+refresh();
+setInterval(refresh, 10000);
+</script>
+</main></body>
+</html>
