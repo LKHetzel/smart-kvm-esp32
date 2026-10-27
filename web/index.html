@@ -7,7 +7,7 @@
 <link rel="stylesheet" href="/app.css">
 </head>
 <body><main>
-<header><h1>TESmart KVM</h1><span class="badge" id="ver">v…</span></header>
+<header><h1 id="title">TESmart KVM</h1><span class="badge" id="ver">v…</span></header>
 
 <h2>Presets</h2>
 <div class="grid" id="presets"></div>
@@ -19,7 +19,7 @@
 
 <p id="msg"></p>
 
-<p><a class="button" href="/advanced">Advanced</a></p>
+<p><a class="button" href="/settings">Settings</a></p>
 
 <footer id="info">Loading…</footer>
 
@@ -36,7 +36,7 @@ function build(st) {
               p.name, el('small', {textContent: desc}));
   }));
   if (!st.presets.length)
-    $('presets').append(el('p', {className: 'note', textContent: 'No presets yet. Add them on the Advanced page.'}));
+    $('presets').append(el('p', {className: 'note', textContent: 'No presets yet. Add them on the Settings page.'}));
   const pcs = st.pcs.map((_, i) => i + 1);
   $('all').replaceChildren(...pcs.map(pc =>
     el('button', {textContent: 'All → ' + pcName(pc), onclick: () => act('/ui/all/pc' + pc)})));
@@ -54,6 +54,8 @@ function render(st) {
     $(`o${n}p${pc}`).classList.toggle('active', o[n] === pc);
   st.presets.forEach((p, i) =>
     $('p' + i).classList.toggle('active', p.outputs.every((pc, k) => !pc || o[k + 1] === pc)));
+  $('title').textContent = st.title;
+  document.title = st.title;
   renderInfo(st);
 }
 

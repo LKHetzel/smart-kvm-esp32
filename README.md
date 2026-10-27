@@ -8,6 +8,7 @@ Features:
 - Named PCs and up to 8 custom presets, set up from the web page
 - Front-panel input changes are picked up and shown on the page
 - Separate login for the web page and bearer token for the API
+- Companion button feedback: routing state is pushed to Companion custom variables as it changes
 - Firmware updates over Wi-Fi after the first USB flash
 - Settings export, import and factory reset
 - Serial tools for working with the KVM protocol: raw hex sender, baud setting, live log
@@ -16,12 +17,12 @@ Features:
 
 This firmware was developed and tested on the HDK403-P23. It will likely work with other TESmart KVMs that have a UART service port, since they appear to share the same `AA BB …` command family. TESmart's manual for a 2-PC triple-monitor model documents the same switch commands. Check these differences before relying on it:
 
-- **Baud rate:** the HDK403-P23 uses 9600, but the 2-PC model's manual says 38400. Change it on the Advanced page.
+- **Baud rate:** the HDK403-P23 uses 9600, but the 2-PC model's manual says 38400. Change it on the Settings page.
 - **Frame ending:** the HDK403-P23 needs a checksum as the last byte. The manual shows a fixed `EE` instead. The firmware always sends the checksum. If your model only accepts `EE`, change the last byte in `sendKvm()` in `src/main.cpp`.
 - **Number of PCs and outputs:** the page offers 4 PCs and 3 outputs. On a model with fewer, the extra buttons do nothing.
 - **Front-panel reports:** these may differ or be missing, which would leave the page's routing display stale after a front-panel change.
 
-To check a new model, use the Advanced page:
+To check a new model, use the Settings page's **Serial** tab:
 
 1. Try each baud rate and watch the serial log while you press a front-panel input button. Clean frames starting `AA BB` mean the rate is right.
 2. Send a switch command with and without **Add checksum byte**, for example `AA BB 03 01 01`, and see whether the KVM switches.
@@ -91,7 +92,7 @@ Optional settings at the top of `src/main.cpp`:
 |---|---|---|
 | `HOSTNAME` | `kvm-controller` | mDNS name (`kvm-controller.local`) and Wi-Fi hostname |
 | `FW_VERSION` | | Shown on the web page. Bump it for each release. |
-| `DEFAULT_KVM_BAUD` | `9600` | Used until a different rate is saved from the Advanced page |
+| `DEFAULT_KVM_BAUD` | `9600` | Used until a different rate is saved from the Settings page |
 | `KVM_TX_PIN`, `KVM_RX_PIN` | `17`, `16` | UART pins |
 
 ### 2. First flash (USB)
@@ -110,7 +111,7 @@ The serial log shows the IP address once Wi-Fi connects:
 ```text
 WiFi connected: 192.168.1.50
 mDNS: http://kvm-controller.local/
-TESmart ESP32 controller v0.7.0 (...) ready, KVM serial 9600 baud
+TESmart ESP32 controller v1.0.0 (...) ready, KVM serial 9600 baud
 ```
 
 If Wi-Fi can't connect within 30 seconds, the ESP32 restarts and tries again.
@@ -125,7 +126,7 @@ Build without flashing:
 pio run
 ```
 
-Then open **Advanced → Firmware update** on the web page and upload `.pio/build/esp32dev/firmware.bin`. The controller installs it and restarts. The page reloads when it's back. Names, presets and other settings are kept.
+Then open **Settings → Firmware** on the web page and upload `.pio/build/esp32dev/firmware.bin`. The controller installs it and restarts. The page reloads when it's back. Names, presets and other settings are kept.
 
 ## Using it
 
@@ -135,29 +136,33 @@ Open `http://kvm-controller.local/`, or use the IP address if your network doesn
 
 The main page has:
 
+The page heading and browser tab show the controller name, which you can change in Settings.
+
 - **Presets:** one button per saved preset. The button matching the current routing is highlighted.
 - **All → PC:** switch every output to one PC.
 - **Outputs:** switch each of the three outputs on its own. The current PC is highlighted.
 
 The routing display refreshes every 10 seconds.
 
-### Advanced page
+### Settings page
 
-Open it with the **Advanced** button at the bottom of the main page.
+Open it with the **Settings** button at the bottom of the main page, or go to `/settings`. It's split into tabs, and the selected tab stays in the address (for example `/settings#serial`).
 
-- **PC names:** rename PC1–PC4. The names appear on every button.
-- **Presets:** add, edit and delete up to 8 presets. Each sets every output to a PC, or leaves it unchanged.
-- **Backup & reset:**
-  - **Export:** downloads the PC names, presets and baud rate as a JSON file.
+- **General:**
+  - **Controller name:** shown as the main page heading and the browser tab title. The default is "TESmart KVM".
+  - **PC names:** rename PC1–PC4. The names appear on every button.
+  - **Presets:** add, edit and delete up to 8 presets. Each sets every output to a PC, or leaves it unchanged.
+- **Companion:** where to send state for Companion button feedback. See [Companion](#companion).
+- **Serial:** change the baud rate, send raw hex (with the checksum added automatically, if you choose), run the status query, and watch the log of the last 40 frames sent and received.
+- **Backup:**
+  - **Export:** downloads the controller name, PC names, presets, Companion settings and baud rate as a JSON file.
   - **Import:** restores such a file.
   - **Factory reset:** erases all saved settings and restarts.
 
   None of these touch the Wi-Fi details, API token or web login, because those are built into the firmware.
-- **KVM serial:** change the baud rate, send raw hex (with the checksum added automatically, if you choose), and run the status query.
-- **Serial log:** the last 40 frames sent and received, updated every second.
-- **Firmware update:** see [Later updates](#3-later-updates-over-wi-fi).
+- **Firmware:** see [Later updates](#3-later-updates-over-wi-fi).
 
-A new controller starts with no presets and the names PC1–PC4.
+A new controller starts with the default name, no presets and the PC names PC1–PC4.
 
 ## API
 
@@ -171,7 +176,7 @@ Authorization: Bearer YOUR_TOKEN
 |---|---|
 | `GET /health` | Liveness check, no auth |
 | `GET /api/status` | Current state, as shown below |
-| `POST /api/preset/<n>` | Apply preset `n`, numbered from 1 in the order shown on the Advanced page |
+| `POST /api/preset/<n>` | Apply preset `n`, numbered from 1 in the order shown on the Settings page |
 | `POST /api/all/pc<1-4>` | Switch every output to one PC |
 | `POST /api/output/<1-3>/pc/<1-4>` | Switch one output |
 | `POST /api/query` | Send the manual's status query and return any raw reply as hex. The HDK403-P23 hasn't answered it. |
@@ -180,23 +185,41 @@ Responses:
 
 ```json
 {"ok":true,"action":"preset-1","state":{
-  "version":"0.7.0","build":"...","uptime":1234,"hostname":"kvm-controller","ip":"192.168.1.50","rssi":-60,
+  "version":"1.0.0","build":"...","uptime":1234,"title":"TESmart KVM","hostname":"kvm-controller","ip":"192.168.1.50","rssi":-60,
   "pcs":["PC1","PC2","PC3","PC4"],
   "presets":[{"name":"My preset","outputs":[1,1,2]}],
+  "activePreset":1,
   "outputs":{"1":1,"2":1,"3":2}}}
 ```
 
-`/api/status` returns `{"ok":true,"state":{...}}`. In `outputs`, `0` means unknown. Otherwise the value is the PC number. In a preset's `outputs`, `0` means "leave unchanged". Errors return `{"ok":false,"error":"..."}` with a 4xx or 5xx status.
+`/api/status` returns `{"ok":true,"state":{...}}`. In `outputs`, `0` means unknown. Otherwise the value is the PC number. In a preset's `outputs`, `0` means "leave unchanged". `activePreset` is the number of the first preset matching the current routing, or `0` if none does. Errors return `{"ok":false,"error":"..."}` with a 4xx or 5xx status.
 
 Deleting a preset renumbers the presets after it, so update any Companion buttons that point at those numbers.
 
 ### Companion
 
-Use the Generic HTTP module's POST action, with the `Authorization` header shown above:
+**Actions:** use the Generic HTTP module's POST action, with the `Authorization` header shown above:
 
 - `http://kvm-controller.local/api/preset/1`
 - `http://kvm-controller.local/api/all/pc2`
 - `http://kvm-controller.local/api/output/3/pc/1`
+
+**Feedback:** the controller pushes its routing state into Companion custom variables through Companion's HTTP API. This covers changes made from the front panel, so buttons stay in sync without polling.
+
+1. In Companion, go to **Variables → Custom variables** and create `kvm_out1`, `kvm_out2`, `kvm_out3` and `kvm_preset`.
+2. On the controller's Settings page, in the **Companion** tab, enter Companion's IP address and port (8000 by default), then click **Save** and **Send now**. The status line shows whether it worked, and names any variable that's missing.
+3. On a Companion button, add the internal **Variable: Check value** feedback. For example, highlight the button when `$(custom:kvm_out1)` equals `2`.
+
+**Prefix:** every variable name starts with the prefix, which is `kvm` by default. The prefix `kvm` gives `kvm_out1`, and `desk` gives `desk_out1`. If you have more than one controller, give each one its own prefix, so they don't overwrite each other's variables in Companion. The Companion tab lists the exact names to create. The prefix can be up to 16 letters, digits, `_` or `-`.
+
+What the variables hold:
+
+| Variable | Value |
+|---|---|
+| `kvm_out1`–`kvm_out3` | PC number on each output (`0` = unknown) |
+| `kvm_preset` | Number of the matching preset (`0` = none) |
+
+The controller sends a variable as soon as its value changes, and resends all of them every 60 seconds in case Companion restarted. Each request times out after 500 ms, and after a failure the controller waits 10 seconds before trying again. Use an IP address for Companion, because `.local` names don't resolve from the ESP32.
 
 ### Web page endpoints
 
@@ -207,8 +230,12 @@ The built-in pages use `/ui/*` with the web login instead of the token. Every `/
 | `POST /ui/config/pcs` | `pc1`–`pc4`. A blank name resets to the default. |
 | `POST /ui/config/preset/save` | `index` (0 for new), `name`, `o1`–`o3` (0–4) |
 | `POST /ui/config/preset/delete` | `index` |
+| `POST /ui/config/title` | `title` (up to 32 bytes). A blank title resets to the default. |
+| `POST /ui/config/companion` | `companionHost` (blank turns feedback off), `companionPort`, `companionPrefix` |
+| `GET /ui/companion` | None. Returns the Companion settings and the result of the last send. |
+| `POST /ui/companion/test` | None. Sends every variable now and returns the result. |
 | `GET /ui/config/export` | Downloads the settings JSON |
-| `POST /ui/config/import` | `baud`, `pc1`–`pc4`, `presets` (the count), then `p<n>name` and `p<n>o1`–`p<n>o3` for each preset. All fields are validated before anything is saved. |
+| `POST /ui/config/import` | `baud`, `title`, `pc1`–`pc4`, the Companion fields, `presets` (the count), then `p<n>name` and `p<n>o1`–`p<n>o3` for each preset. All fields are validated before anything is saved. |
 | `POST /ui/config/reset` | None. Factory reset, then restart. |
 | `POST /ui/serial/send` | `hex` (up to 64 bytes) and `checksum=1` to append the checksum. Returns any reply received within 120 ms. |
 | `POST /ui/serial/baud` | `baud`: 9600, 19200, 38400, 57600 or 115200 |
@@ -219,7 +246,7 @@ The built-in pages use `/ui/*` with the web login instead of the token. Every `/
 
 ## Security
 
-- Traffic is plain HTTP, so the token and web login can be read by anyone watching the network. Keep the controller on a trusted LAN or VLAN, and don't expose it to the internet.
+- Traffic is plain HTTP, so the token and web login can be read by anyone watching the network. Keep the controller on a trusted LAN or VLAN, and **don't expose it to the internet!** That would be very, very unwise.
 - The API token only allows switching, status and the status query. Configuration, serial tools and firmware updates need the web login.
 
 ## Routing state
@@ -248,7 +275,7 @@ platformio.ini            Board, framework and embedded web files
 include/secrets.example.h Template for include/secrets.h (gitignored)
 src/main.cpp              Firmware
 web/index.html            Main page
-web/advanced.html         Advanced page
+web/settings.html         Settings page
 web/app.css, web/app.js   Shared styles and helpers
 ```
 

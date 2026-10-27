@@ -3,12 +3,28 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TESmart KVM · Advanced</title>
+<title>Settings</title>
 <link rel="stylesheet" href="/app.css">
 </head>
 <body><main>
-<header><h1>Advanced</h1><span class="badge" id="ver">v…</span></header>
+<header><h1>Settings</h1><span class="badge" id="ver">v…</span></header>
 <p><a class="button" href="/">← Back to controls</a></p>
+
+<nav class="tabs" role="tablist">
+  <button role="tab" data-tab="general">General</button>
+  <button role="tab" data-tab="companion">Companion</button>
+  <button role="tab" data-tab="serial">Serial</button>
+  <button role="tab" data-tab="backup">Backup</button>
+  <button role="tab" data-tab="firmware">Firmware</button>
+</nav>
+
+<p id="msg"></p>
+
+<section data-tab="general" hidden>
+<h2>Controller name</h2>
+<div class="field"><input id="devTitle" maxlength="32" placeholder="TESmart KVM"></div>
+<p><button onclick="saveTitle()">Save name</button></p>
+<p class="note">Shown as the main page heading and the browser tab title.</p>
 
 <h2>PC names</h2>
 <div class="field"><label for="pc1">PC1</label><input id="pc1" maxlength="24"></div>
@@ -21,18 +37,20 @@
 <div id="presetList"></div>
 <p><button onclick="$('presetList').append(presetCard({name: '', outputs: [0, 0, 0]}, 0))">Add preset</button></p>
 <p class="note">"Unchanged" leaves that output where it is. You can have up to 8 presets. Companion can trigger them with <code>POST /api/preset/&lt;number&gt;</code>, numbered from 1 in this order.</p>
+</section>
 
-<p id="msg"></p>
+<section data-tab="companion" hidden>
+<h2>Companion feedback</h2>
+<div class="field"><label for="cmpHost">Host</label><input id="cmpHost" placeholder="Companion IP or hostname (blank = off)" autocomplete="off" spellcheck="false"></div>
+<div class="field"><label for="cmpPort">Port</label><input id="cmpPort" type="number" min="1" max="65535" placeholder="8000"></div>
+<div class="field"><label for="cmpPrefix">Prefix</label><input id="cmpPrefix" maxlength="16" placeholder="kvm" autocomplete="off" spellcheck="false"></div>
+<p class="note">Start of each variable name. Give each controller its own if you have more than one.</p>
+<div class="actions"><button onclick="saveCompanion()">Save</button><button onclick="testCompanion()">Send now</button></div>
+<p class="note" id="cmpResult"></p>
+<p class="note">Create these custom variables in Companion: <code id="cmpVars"></code>. See the README for how to use them on buttons.</p>
+</section>
 
-<h2>Backup &amp; reset</h2>
-<p><a class="button" href="/ui/config/export" download>Export settings</a></p>
-<div class="field">
-  <input type="file" id="importFile" accept=".json,application/json">
-  <button onclick="importSettings()">Import</button>
-</div>
-<p><button onclick="factoryReset()">Factory reset</button></p>
-<p class="note">The settings file holds the PC names, presets and baud rate. Importing one replaces all of them. Factory reset erases every saved setting and restarts the controller. Neither one touches the Wi-Fi details, API token or web login, which are built into the firmware.</p>
-
+<section data-tab="serial" hidden>
 <h2>KVM serial</h2>
 <div class="field">
   <label for="baud">Baud rate</label>
@@ -54,7 +72,20 @@
 <h2>Serial log</h2>
 <pre id="log"></pre>
 <p><button class="small" onclick="$('log').textContent = ''">Clear</button></p>
+</section>
 
+<section data-tab="backup" hidden>
+<h2>Backup &amp; reset</h2>
+<p><a class="button" href="/ui/config/export" download>Export settings</a></p>
+<div class="field">
+  <input type="file" id="importFile" accept=".json,application/json">
+  <button onclick="importSettings()">Import</button>
+</div>
+<p><button onclick="factoryReset()">Factory reset</button></p>
+<p class="note">The settings file holds the controller name, PC names, presets, Companion settings and baud rate. Importing one replaces all of them. Factory reset erases every saved setting and restarts the controller. Neither one touches the Wi-Fi details, API token or web login, which are built into the firmware.</p>
+</section>
+
+<section data-tab="firmware" hidden>
 <h2>Firmware update</h2>
 <div class="field">
   <input type="file" id="fw" accept=".bin">
@@ -62,6 +93,7 @@
 </div>
 <progress id="prog" max="100" value="0" hidden></progress>
 <p class="note">Upload <code>.pio/build/esp32dev/firmware.bin</code>. The controller restarts once it's installed.</p>
+</section>
 
 <footer id="info">Loading…</footer>
 
@@ -71,6 +103,8 @@ let cfg = null;
 
 function loadConfig(st) {
   cfg = st;
+  document.title = st.title + ' · Settings';
+  $('devTitle').value = st.title;
   st.pcs.forEach((n, i) => $('pc' + (i + 1)).value = n);
   $('presetList').replaceChildren(...st.presets.map((p, i) => presetCard(p, i + 1)));
 }
@@ -91,6 +125,14 @@ function presetCard(p, index) {
       index ? el('button', {textContent: 'Delete', onclick: () => deletePreset(index, p.name)})
             : el('button', {textContent: 'Cancel', onclick: () => card.remove()})));
   return card;
+}
+
+function saveTitle() {
+  return busy(async () => {
+    const j = await req('/ui/config/title', 'POST', new URLSearchParams({title: $('devTitle').value}));
+    loadConfig(j.state);
+    say('Name saved', true);
+  });
 }
 
 function savePcNames() {
@@ -119,6 +161,38 @@ function deletePreset(index, name) {
   });
 }
 
+// fillInputs is false for the periodic refresh, so it never overwrites what's being typed.
+function renderCompanion(j, fillInputs = true) {
+  if (fillInputs) {
+    $('cmpHost').value = j.companion.host;
+    $('cmpPort').value = j.companion.port;
+    $('cmpPrefix').value = j.companion.prefix;
+  }
+  $('cmpVars').textContent = ['out1', 'out2', 'out3', 'preset'].map(v => j.companion.prefix + '_' + v).join(', ');
+  $('cmpResult').textContent = 'Status: ' + j.result;
+}
+
+async function loadCompanion(fillInputs = true) {
+  try { renderCompanion(await req('/ui/companion'), fillInputs); } catch (e) {}
+}
+
+function saveCompanion() {
+  return busy(async () => {
+    const j = await req('/ui/config/companion', 'POST', new URLSearchParams({
+      companionHost: $('cmpHost').value, companionPort: $('cmpPort').value, companionPrefix: $('cmpPrefix').value}));
+    renderCompanion(j);
+    say('Companion settings saved', true);
+  });
+}
+
+function testCompanion() {
+  return busy(async () => {
+    const j = await req('/ui/companion/test', 'POST');
+    renderCompanion(j);
+    say(j.result.startsWith('OK') ? 'Sent to Companion' : j.result, j.result.startsWith('OK'));
+  });
+}
+
 async function importSettings() {
   const f = $('importFile').files[0];
   if (!f) return say('Choose a settings file first', false);
@@ -128,7 +202,9 @@ async function importSettings() {
     return say('Not a settings file exported from this controller', false);
   if (!confirm(`Replace the current names and presets with the ${cfgFile.presets.length} preset(s) in ${f.name}?`)) return;
 
-  const params = new URLSearchParams({baud: cfgFile.baud, presets: cfgFile.presets.length});
+  const c = cfgFile.companion || {};
+  const params = new URLSearchParams({baud: cfgFile.baud, title: cfgFile.title || '', presets: cfgFile.presets.length,
+    companionHost: c.host || '', companionPort: c.port || '', companionPrefix: c.prefix || ''});
   cfgFile.pcs.forEach((n, i) => params.set('pc' + (i + 1), n));
   cfgFile.presets.forEach((p, i) => {
     params.set(`p${i + 1}name`, p.name);
@@ -137,6 +213,7 @@ async function importSettings() {
   return busy(async () => {
     const j = await req('/ui/config/import', 'POST', params);
     loadConfig(j.state);
+    loadCompanion();
     baudLoaded = false;
     say('Settings imported', true);
     pollLog();
@@ -221,8 +298,29 @@ async function waitForRestart() {
 }
 
 req('/ui/status').then(j => { renderInfo(j.state); loadConfig(j.state); }).catch(e => say('Status failed: ' + e.message, false));
-pollLog();
-setInterval(pollLog, 1000);
+// Tabs: the active one lives in the URL hash (#serial etc.) so it survives a reload and can be bookmarked.
+const tabs = [...document.querySelectorAll('nav.tabs button')].map(b => b.dataset.tab);
+let activeTab = '';
+
+function showTab(name) {
+  if (!tabs.includes(name)) name = tabs[0];
+  activeTab = name;
+  document.querySelectorAll('nav.tabs button').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === name);
+    b.setAttribute('aria-selected', b.dataset.tab === name);
+  });
+  document.querySelectorAll('section[data-tab]').forEach(s => s.hidden = s.dataset.tab !== name);
+  if (name === 'serial') pollLog();
+}
+
+document.querySelectorAll('nav.tabs button').forEach(b => b.onclick = () => { location.hash = b.dataset.tab; });
+window.addEventListener('hashchange', () => showTab(location.hash.slice(1)));
+showTab(location.hash.slice(1));
+
+// Background refreshes only run for the tab that shows them.
+loadCompanion();
+setInterval(() => { if (activeTab === 'companion') loadCompanion(false); }, 10000);
+setInterval(() => { if (activeTab === 'serial') pollLog(); }, 1000);
 </script>
 </main></body>
 </html>

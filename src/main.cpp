@@ -18,7 +18,7 @@
 static const char* HOSTNAME = "kvm-controller";
 
 // Bump on each release; shown in the web pages, /status and the serial log.
-static const char* FW_VERSION = "0.7.0";
+static const char* FW_VERSION = "1.0.0";
 static const char* FW_BUILD = __DATE__ " " __TIME__;
 
 // ESP32 UART2 pins. These go to the TRRS terminal adapter.
@@ -29,7 +29,7 @@ static const char* FW_BUILD = __DATE__ " " __TIME__;
 static constexpr int KVM_TX_PIN = 17;
 static constexpr int KVM_RX_PIN = 16;
 
-// Default baud rate; can be changed from the Advanced page (saved in NVS).
+// Default baud rate; can be changed from the Settings page (saved in NVS).
 static constexpr uint32_t DEFAULT_KVM_BAUD = 9600; // confirmed on the HDK403-P23 (the 2-PC manual says 38400)
 static constexpr uint32_t SUPPORTED_BAUDS[] = {9600, 19200, 38400, 57600, 115200};
 
@@ -42,18 +42,29 @@ static constexpr uint32_t REPLY_WAIT_MS = 120;
 static constexpr uint32_t RX_GAP_MS = 20;
 static constexpr size_t RAW_MAX_BYTES = 64;
 
-// PC names and presets are edited on the Advanced page and saved in NVS.
+// The controller name, PC names and presets are edited on the Settings page and saved in NVS.
 static constexpr size_t NAME_MAX_LEN = 24; // bytes
+static constexpr size_t TITLE_MAX_LEN = 32; // bytes
+static const char* DEFAULT_TITLE = "TESmart KVM";
 static constexpr size_t MAX_PRESETS = 8;
 
 static constexpr uint8_t NUM_PCS = 4;
+
+// Companion feedback: state is pushed to Companion custom variables when it changes, plus a
+// periodic full resend in case Companion restarted. Requests are short so a missing Companion
+// can't stall the web server for long.
+static constexpr uint16_t DEFAULT_COMPANION_PORT = 8000;
+static constexpr uint32_t COMPANION_TIMEOUT_MS = 500;
+static constexpr uint32_t COMPANION_RETRY_MS = 10000;
+static constexpr uint32_t COMPANION_RESYNC_MS = 60000;
+static constexpr size_t COMPANION_PREFIX_MAX_LEN = 16;
 
 // Reboot if Wi-Fi can't connect at boot within this time.
 static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 30000;
 
 // Web assets from web/, embedded by board_build.embed_txtfiles in platformio.ini.
 extern const char INDEX_HTML[] asm("_binary_web_index_html_start");
-extern const char ADVANCED_HTML[] asm("_binary_web_advanced_html_start");
+extern const char SETTINGS_HTML[] asm("_binary_web_settings_html_start");
 extern const char APP_CSS[] asm("_binary_web_app_css_start");
 extern const char APP_JS[] asm("_binary_web_app_js_start");
 
@@ -78,6 +89,20 @@ struct Preset {
 static Preset presets[MAX_PRESETS];
 static size_t presetCount = 0;
 static String pcNames[NUM_PCS];
+static String deviceTitle; // shown as the page heading and browser tab title
+
+struct CompanionConfig {
+  String host; // blank = disabled
+  uint16_t port = DEFAULT_COMPANION_PORT;
+  String prefix = "kvm";
+};
+
+static CompanionConfig companion;
+static const char* COMPANION_VARS[] = {"out1", "out2", "out3", "preset"};
+static int companionPushed[4] = {-1, -1, -1, -1}; // last values Companion accepted; -1 forces a push
+static uint32_t companionRetryAt = 0;
+static uint32_t companionSyncedAt = 0;
+static String companionResult = "Not configured";
 static uint32_t kvmBaud = DEFAULT_KVM_BAUD;
 static bool wifiWasConnected = false;
 
@@ -165,10 +190,15 @@ static void savePresets() {
 }
 
 static void loadConfig() {
+  deviceTitle = prefs.getString("title", DEFAULT_TITLE);
   for (uint8_t i = 0; i < NUM_PCS; i++) {
     String n = String(i + 1);
     pcNames[i] = prefs.getString(("pc" + n + "name").c_str(), "PC" + n);
   }
+
+  companion.host = prefs.getString("cmpHost", "");
+  companion.port = prefs.getUShort("cmpPort", DEFAULT_COMPANION_PORT);
+  companion.prefix = prefs.getString("cmpPrefix", "kvm");
 
   if (prefs.isKey("presetCount")) {
     presetCount = prefs.getUChar("presetCount", 0);
@@ -177,17 +207,17 @@ static void loadConfig() {
       return;
     }
   }
-  // First boot (or unreadable data): no presets until they're added on the Advanced page.
+  // First boot (or unreadable data): no presets until they're added on the Settings page.
   presetCount = 0;
 }
 
-// Drops control characters, trims, and truncates to NAME_MAX_LEN bytes without splitting a UTF-8 character.
-static String cleanName(const String& in) {
+// Drops control characters, trims, and truncates to maxLen bytes without splitting a UTF-8 character.
+static String cleanName(const String& in, size_t maxLen = NAME_MAX_LEN) {
   String out;
   for (char c : in) if ((uint8_t)c >= 0x20 && c != 0x7F) out += c;
   out.trim();
-  if (out.length() > NAME_MAX_LEN) {
-    size_t n = NAME_MAX_LEN;
+  if (out.length() > maxLen) {
+    size_t n = maxLen;
     while (n > 0 && ((uint8_t)out[n] & 0xC0) == 0x80) n--;
     out = out.substring(0, n);
   }
@@ -333,6 +363,19 @@ static bool routeOutput(uint8_t output, uint8_t pc) {
   return true;
 }
 
+// 1-based number of the first preset whose routed outputs all match the current state, or 0.
+static int activePreset() {
+  const uint8_t current[3] = {state.output1, state.output2, state.output3};
+  for (size_t i = 0; i < presetCount; i++) {
+    bool match = true;
+    for (int o = 0; o < 3; o++) {
+      if (presets[i].outputs[o] && presets[i].outputs[o] != current[o]) match = false;
+    }
+    if (match) return i + 1;
+  }
+  return 0;
+}
+
 static void applyPreset(const Preset& p) {
   bool first = true;
   for (uint8_t o = 0; o < 3; o++) {
@@ -344,6 +387,125 @@ static void applyPreset(const Preset& p) {
 }
 
 // ---------------------------
+// Companion feedback
+// ---------------------------
+// Minimal HTTP/1.1 POST with an empty body. HTTPClient would do, but it pulls in TLS (~165 KB of flash).
+// Returns the HTTP status, or -1 can't connect, -2 no reply in time, -3 unreadable reply.
+static int companionPost(const String& path) {
+  WiFiClient client;
+  if (!client.connect(companion.host.c_str(), companion.port, COMPANION_TIMEOUT_MS)) return -1;
+  client.print("POST " + path + " HTTP/1.1\r\nHost: " + companion.host + ":" + String(companion.port) +
+               "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+
+  // Only the status line ("HTTP/1.1 200 OK") is needed.
+  String line;
+  uint32_t start = millis();
+  while (millis() - start < COMPANION_TIMEOUT_MS) {
+    while (client.available()) {
+      char c = client.read();
+      if (c == '\n') {
+        client.stop();
+        int space = line.indexOf(' ');
+        return space > 0 ? line.substring(space + 1).toInt() : -3;
+      }
+      if (line.length() < 64) line += c;
+    }
+    if (!client.connected()) break;
+    delay(1);
+  }
+  client.stop();
+  return -2;
+}
+
+static bool pushCompanionVariable(const char* name, int value) {
+  String var = companion.prefix + "_" + name;
+  int code = companionPost("/api/custom-variable/" + var + "/value?value=" + String(value));
+  if (code >= 200 && code < 300) return true;
+  if (code == -1) companionResult = "Can't connect to Companion at " + companion.host + ":" + String(companion.port);
+  else if (code == -2) companionResult = "Companion didn't reply";
+  else if (code == -3) companionResult = "Unreadable reply from Companion";
+  else if (code == 404) companionResult = "Companion has no custom variable \"" + var + "\". Create it under Variables.";
+  else companionResult = "Companion returned HTTP " + String(code) + " for " + var;
+  return false;
+}
+
+// Pushes changed values (or all of them when full is set). Returns false on the first failure.
+static bool syncCompanion(bool full) {
+  int values[4] = {state.output1, state.output2, state.output3, activePreset()};
+  for (int i = 0; i < 4; i++) {
+    if (!full && values[i] == companionPushed[i]) continue;
+    if (!pushCompanionVariable(COMPANION_VARS[i], values[i])) return false;
+    companionPushed[i] = values[i];
+  }
+  companionResult = "OK, last sent at " + String(millis() / 1000) + "s uptime";
+  return true;
+}
+
+static void companionLoop() {
+  if (!companion.host.length() || WiFi.status() != WL_CONNECTED) return;
+  uint32_t now = millis();
+  if ((int32_t)(now - companionRetryAt) < 0) return;
+
+  bool full = companionSyncedAt == 0 || now - companionSyncedAt > COMPANION_RESYNC_MS;
+  int values[4] = {state.output1, state.output2, state.output3, activePreset()};
+  bool changed = false;
+  for (int i = 0; i < 4; i++) changed |= values[i] != companionPushed[i];
+  if (!full && !changed) return;
+
+  if (syncCompanion(full)) {
+    if (full) companionSyncedAt = now ? now : 1;
+  } else {
+    companionRetryAt = now + COMPANION_RETRY_MS;
+  }
+}
+
+// Forces every variable to be resent on the next loop.
+static void resetCompanionSync() {
+  for (int& v : companionPushed) v = -1;
+  companionRetryAt = millis();
+  companionSyncedAt = 0;
+  companionResult = companion.host.length() ? "Waiting to send" : "Not configured";
+}
+
+// Host: letters, digits, dots, dashes. Prefix: letters, digits, underscores, dashes.
+static bool validCompanionHost(const String& h) {
+  if (h.length() > 64) return false;
+  for (char c : h) if (!isalnum((unsigned char)c) && c != '.' && c != '-') return false;
+  return true;
+}
+
+static bool validCompanionPrefix(const String& p) {
+  if (!p.length() || p.length() > COMPANION_PREFIX_MAX_LEN) return false;
+  for (char c : p) if (!isalnum((unsigned char)c) && c != '_' && c != '-') return false;
+  return true;
+}
+
+// Reads companionHost/companionPort/companionPrefix form fields. Returns an error message, or "" if valid.
+static String companionFromArgs(CompanionConfig& out) {
+  out.host = server.arg("companionHost");
+  out.host.trim();
+  if (!validCompanionHost(out.host)) return "Companion host must be an IP address or hostname";
+  String port = server.arg("companionPort");
+  long p = port.length() ? port.toInt() : DEFAULT_COMPANION_PORT;
+  if (p < 1 || p > 65535) return "Companion port must be 1-65535";
+  out.port = p;
+  String prefix = server.arg("companionPrefix");
+  out.prefix = prefix.length() ? prefix : "kvm";
+  if (!validCompanionPrefix(out.prefix)) {
+    return "variable prefix must be 1-" + String(COMPANION_PREFIX_MAX_LEN) + " letters, digits, _ or -";
+  }
+  return "";
+}
+
+static void saveCompanion(const CompanionConfig& c) {
+  companion = c;
+  prefs.putString("cmpHost", companion.host);
+  prefs.putUShort("cmpPort", companion.port);
+  prefs.putString("cmpPrefix", companion.prefix);
+  resetCompanionSync();
+}
+
+// ---------------------------
 // HTTP handlers
 // ---------------------------
 static String stateJson() {
@@ -351,6 +513,7 @@ static String stateJson() {
   json += "\"version\":\"" + String(FW_VERSION) + "\",";
   json += "\"build\":\"" + String(FW_BUILD) + "\",";
   json += "\"uptime\":" + String(millis() / 1000) + ",";
+  json += "\"title\":" + jsonString(deviceTitle) + ",";
   json += "\"hostname\":\"" + String(HOSTNAME) + "\",";
   json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
   json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
@@ -365,6 +528,7 @@ static String stateJson() {
             String(p.outputs[1]) + "," + String(p.outputs[2]) + "]}";
   }
   json += "],";
+  json += "\"activePreset\":" + String(activePreset()) + ",";
   json += "\"outputs\":{";
   json += "\"1\":" + String(state.output1) + ",";
   json += "\"2\":" + String(state.output2) + ",";
@@ -399,6 +563,13 @@ static void handlePresetApply(const char* path) {
   sendJsonOk(("preset-" + String(n)).c_str());
 }
 
+// Saves the controller name from form field title. Blank resets to the default.
+static void saveTitleFromArgs() {
+  String title = cleanName(server.arg("title"), TITLE_MAX_LEN);
+  deviceTitle = title.length() ? title : DEFAULT_TITLE;
+  prefs.putString("title", deviceTitle);
+}
+
 // Saves PC names from form fields pc1..pc4. Blank resets to the default name.
 static void savePcNamesFromArgs() {
   for (uint8_t i = 0; i < NUM_PCS; i++) {
@@ -429,6 +600,12 @@ static void applyBaud(uint32_t baud) {
   kvmBaud = baud;
   KvmSerial.updateBaudRate(kvmBaud);
   prefs.putUInt("baud", kvmBaud);
+}
+
+// POST title=<name>. Blank resets to the default.
+static void handleSaveTitle() {
+  saveTitleFromArgs();
+  sendJsonOk("save-title");
 }
 
 // POST pc1=<name>...pc4=<name>. Blank resets to the default name.
@@ -462,10 +639,46 @@ static void handleSavePreset() {
   sendJsonOk("save-preset");
 }
 
+static String companionJson() {
+  return "{\"host\":" + jsonString(companion.host) + ",\"port\":" + String(companion.port) +
+         ",\"prefix\":" + jsonString(companion.prefix) + "}";
+}
+
+// GET: Companion settings and the result of the last push.
+static void handleCompanionStatus() {
+  server.send(200, "application/json",
+              "{\"ok\":true,\"companion\":" + companionJson() + ",\"result\":" + jsonString(companionResult) + "}");
+}
+
+// POST companionHost=&companionPort=&companionPrefix=. A blank host turns feedback off.
+static void handleSaveCompanion() {
+  CompanionConfig c;
+  String error = companionFromArgs(c);
+  if (error.length()) {
+    sendJsonError(400, error);
+    return;
+  }
+  saveCompanion(c);
+  handleCompanionStatus();
+}
+
+// POST: send every variable now and report the result.
+static void handleCompanionTest() {
+  if (!companion.host.length()) {
+    sendJsonError(400, "set a Companion host first");
+    return;
+  }
+  resetCompanionSync();
+  if (syncCompanion(true)) companionSyncedAt = millis();
+  else companionRetryAt = millis() + COMPANION_RETRY_MS;
+  handleCompanionStatus();
+}
+
 // GET: settings as a downloadable JSON file. Credentials are compiled in and never included.
 static void handleExportConfig() {
   String json = "{\"type\":\"tesmart-esp32-controller-settings\",\"format\":1,";
-  json += "\"firmware\":\"" + String(FW_VERSION) + "\",\"baud\":" + String(kvmBaud) + ",\"pcs\":[";
+  json += "\"firmware\":\"" + String(FW_VERSION) + "\",\"baud\":" + String(kvmBaud) + ",";
+  json += "\"title\":" + jsonString(deviceTitle) + ",\"companion\":" + companionJson() + ",\"pcs\":[";
   for (uint8_t i = 0; i < NUM_PCS; i++) json += (i ? "," : "") + jsonString(pcNames[i]);
   json += "],\"presets\":[";
   for (size_t i = 0; i < presetCount; i++) {
@@ -479,7 +692,7 @@ static void handleExportConfig() {
   server.send(200, "application/json", json);
 }
 
-// POST baud=&pc1..pc4=&presets=<count>&p1name=&p1o1=..p1o3=&p2name=...
+// POST baud=&title=&pc1..pc4=&companionHost=&companionPort=&companionPrefix=&presets=<count>&p1name=&p1o1=..p1o3=&p2name=...
 // The page parses the exported JSON and sends it as form fields. Everything is validated before anything is saved.
 static void handleImportConfig() {
   uint32_t baud = server.arg("baud").toInt();
@@ -492,6 +705,12 @@ static void handleImportConfig() {
     sendJsonError(400, "too many presets (max " + String(MAX_PRESETS) + ")");
     return;
   }
+  CompanionConfig importedCompanion;
+  String companionError = companionFromArgs(importedCompanion);
+  if (companionError.length()) {
+    sendJsonError(400, companionError);
+    return;
+  }
   Preset imported[MAX_PRESETS];
   for (int i = 0; i < count; i++) {
     String error = presetFromArgs("p" + String(i + 1), imported[i]);
@@ -501,15 +720,17 @@ static void handleImportConfig() {
     }
   }
 
+  saveTitleFromArgs();
   savePcNamesFromArgs();
   memcpy(presets, imported, sizeof(Preset) * count);
   presetCount = count;
   savePresets();
   applyBaud(baud);
+  saveCompanion(importedCompanion);
   sendJsonOk("import");
 }
 
-// POST: erase every saved setting (names, presets, baud, routing state) and restart.
+// POST: erase every saved setting (title, names, presets, baud, Companion, routing state) and restart.
 // Wi-Fi, the API token and the web login are compiled in and unaffected.
 static void handleFactoryReset() {
   prefs.clear();
@@ -677,7 +898,7 @@ static void addRoute(const char* path, HTTPMethod method, void (*handler)()) {
   server.on(String("/ui") + path, method, [handler](){ if (requireUiAuth()) handler(); });
 }
 
-// Registers handler at /ui<path> only. Used for the Advanced page's tools.
+// Registers handler at /ui<path> only. Used for the Settings page's tools.
 static void addUiRoute(const char* path, HTTPMethod method, void (*handler)()) {
   server.on(String("/ui") + path, method, [handler](){ if (requireUiAuth()) handler(); });
 }
@@ -687,7 +908,11 @@ static void setupRoutes() {
   server.collectHeaders(headerKeys, 2);
 
   server.on("/", HTTP_GET, [](){ serveAsset("text/html", INDEX_HTML); });
-  server.on("/advanced", HTTP_GET, [](){ serveAsset("text/html", ADVANCED_HTML); });
+  server.on("/settings", HTTP_GET, [](){ serveAsset("text/html", SETTINGS_HTML); });
+  server.on("/advanced", HTTP_GET, [](){ // old address for the Settings page
+    server.sendHeader("Location", "/settings");
+    server.send(301);
+  });
   server.on("/app.css", HTTP_GET, [](){ serveAsset("text/css", APP_CSS); });
   server.on("/app.js", HTTP_GET, [](){ serveAsset("application/javascript", APP_JS); });
   server.on("/health", HTTP_GET, [](){ server.send(200, "application/json", "{\"ok\":true}"); });
@@ -695,9 +920,13 @@ static void setupRoutes() {
   addRoute("/status", HTTP_GET, handleStatus);
   addRoute("/query", HTTP_POST, handleQuery);
 
+  addUiRoute("/config/title", HTTP_POST, handleSaveTitle);
   addUiRoute("/config/pcs", HTTP_POST, handleSavePcNames);
   addUiRoute("/config/preset/save", HTTP_POST, handleSavePreset);
   addUiRoute("/config/preset/delete", HTTP_POST, handleDeletePreset);
+  addUiRoute("/config/companion", HTTP_POST, handleSaveCompanion);
+  addUiRoute("/companion", HTTP_GET, handleCompanionStatus);
+  addUiRoute("/companion/test", HTTP_POST, handleCompanionTest);
   addUiRoute("/config/export", HTTP_GET, handleExportConfig);
   addUiRoute("/config/import", HTTP_POST, handleImportConfig);
   addUiRoute("/config/reset", HTTP_POST, handleFactoryReset);
@@ -780,6 +1009,7 @@ void setup() {
   prefs.begin("tesmart", false);
   loadState();
   loadConfig();
+  resetCompanionSync();
   kvmBaud = prefs.getUInt("baud", DEFAULT_KVM_BAUD);
   if (!supportedBaud(kvmBaud)) kvmBaud = DEFAULT_KVM_BAUD;
 
@@ -797,5 +1027,6 @@ void loop() {
   checkWifi();
   pollSerial();
   server.handleClient();
+  companionLoop();
   delay(2);
 }
