@@ -15,7 +15,10 @@
 
 <h2>Outputs</h2>
 <div id="outputs"></div>
-<p class="note">Shows the last route this controller sent. Changes made at the KVM itself aren't reflected.</p>
+
+<h2>Keyboard &amp; mouse</h2>
+<div id="focus"></div>
+<p class="note">Read from the KVM, so changes made at the KVM show up too. The keyboard and mouse can only move to a PC that's on an output, and the monitors showing the old PC blink briefly when they do.</p>
 
 <p id="msg"></p>
 
@@ -31,7 +34,8 @@ let builtFor = '';
 function build(st) {
   const pcName = pc => st.pcs[pc - 1];
   $('presets').replaceChildren(...st.presets.map((p, i) => {
-    const desc = p.outputs.map((pc, o) => pc ? `${o + 1} → ${pcName(pc)}` : null).filter(Boolean).join(', ');
+    const desc = [...p.outputs.map((pc, o) => pc ? `${o + 1} → ${pcName(pc)}` : null),
+                  p.focus ? `K/M → ${pcName(p.focus)}` : null].filter(Boolean).join(', ');
     return el('button', {className: 'preset', id: 'p' + i, onclick: () => act('/ui/preset/' + (i + 1))},
               p.name, el('small', {textContent: desc}));
   }));
@@ -44,6 +48,9 @@ function build(st) {
     el('span', {textContent: 'Output ' + n}),
     ...pcs.map(pc => el('button', {id: `o${n}p${pc}`, textContent: pcName(pc),
                                       onclick: () => act(`/ui/output/${n}/pc/${pc}`)})))));
+  $('focus').replaceChildren(el('div', {className: 'row'},
+    el('span', {textContent: 'K/M'}),
+    ...pcs.map(pc => el('button', {id: `fp${pc}`, textContent: pcName(pc), onclick: () => act(`/ui/focus/pc${pc}`)}))));
 }
 
 function render(st) {
@@ -52,8 +59,9 @@ function render(st) {
   const o = st.outputs;
   for (const n of [1, 2, 3]) for (let pc = 1; pc <= st.pcs.length; pc++)
     $(`o${n}p${pc}`).classList.toggle('active', o[n] === pc);
+  for (let pc = 1; pc <= st.pcs.length; pc++) $(`fp${pc}`).classList.toggle('active', st.focus === pc);
   st.presets.forEach((p, i) =>
-    $('p' + i).classList.toggle('active', p.outputs.every((pc, k) => !pc || o[k + 1] === pc)));
+    $('p' + i).classList.toggle('active', p.outputs.every((pc, k) => !pc || o[k + 1] === pc) && (!p.focus || st.focus === p.focus)));
   $('title').textContent = st.title;
   document.title = st.title;
   renderInfo(st);
@@ -61,7 +69,9 @@ function render(st) {
 
 function act(url) {
   return busy(async () => {
-    const j = await req(url, 'POST');
+    let j;
+    try { j = await req(url, 'POST'); }
+    catch (e) { refresh(); throw e; } // a preset can fail partway, so show what actually happened
     render(j.state);
     say('Done: ' + j.action, true);
   });

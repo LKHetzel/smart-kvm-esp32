@@ -5,8 +5,9 @@ ESP32 firmware for controlling a TESmart HDK403-P23 (4 PCs × 3 monitors) KVM ov
 Features:
 
 - Switch any output to any of the four PCs, or switch all outputs at once
-- Named PCs and up to 8 custom presets, set up from the web page
-- Front-panel input changes are picked up and shown on the page
+- Move the keyboard and mouse (K/M) to any PC that's on a monitor
+- Named PCs and up to 8 custom presets covering outputs and K/M, set up from the web page
+- Routing and K/M state is read back from the KVM, so changes made at the KVM show on the page
 - Separate login for the web page and bearer token for the API
 - Companion button feedback: routing state is pushed to Companion custom variables as it changes
 - Firmware updates over Wi-Fi after the first USB flash
@@ -20,7 +21,7 @@ This firmware was developed and tested on the HDK403-P23. It will likely work wi
 - **Baud rate:** the HDK403-P23 uses 9600, but the 2-PC model's manual says 38400. Change it on the Settings page.
 - **Frame ending:** the HDK403-P23 needs a checksum as the last byte. The manual shows a fixed `EE` instead. The firmware always sends the checksum. If your model only accepts `EE`, change the last byte in `sendKvm()` in `src/main.cpp`.
 - **Number of PCs and outputs:** the page offers 4 PCs and 3 outputs. On a model with fewer, the extra buttons do nothing.
-- **Front-panel reports:** these may differ or be missing, which would leave the page's routing display stale after a front-panel change.
+- **Reports and queries:** these may differ or be missing. Without them, the page can show stale routing after a change made at the KVM, K/M focus stays unknown, and the K/M controls won't work.
 
 To check a new model, use the Settings page's **Serial** tab:
 
@@ -58,6 +59,10 @@ The KVM's 3.5 mm TRRS service port carries 3.3 V TTL serial:
 Don't use RS-232 voltage levels, and don't connect the TRRS tip to the ESP32's 3.3 V rail. Power the ESP32 from its own USB supply.
 
 To use different pins, change `KVM_TX_PIN` and `KVM_RX_PIN` in `src/main.cpp`.
+
+This is how I have mine connected, but it's ESP32 - you can do whatever you want hardware wise to make it work for your setup.
+
+I might make a custom PCB at some point and/or 3D print a case.
 
 ## Building and flashing
 
@@ -111,7 +116,7 @@ The serial log shows the IP address once Wi-Fi connects:
 ```text
 WiFi connected: 192.168.1.50
 mDNS: http://kvm-controller.local/
-TESmart ESP32 controller v1.0.0 (...) ready, KVM serial 9600 baud
+TESmart ESP32 controller v1.1.0 (...) ready, KVM serial 9600 baud
 ```
 
 If Wi-Fi can't connect within 30 seconds, the ESP32 restarts and tries again.
@@ -126,7 +131,7 @@ Build without flashing:
 pio run
 ```
 
-Then open **Settings → Firmware** on the web page and upload `.pio/build/esp32dev/firmware.bin`. The controller installs it and restarts. The page reloads when it's back. Names, presets and other settings are kept.
+Then open **Settings → Firmware** on the web page and upload `.pio/build/esp32dev/firmware.bin`. The controller installs it and restarts. The page reloads when it's back. Names, presets and other settings are kept. Presets from 1.0.0 are converted automatically, but 1.0.0 can't read presets saved by 1.1.0.
 
 ## Using it
 
@@ -141,6 +146,7 @@ The page heading and browser tab show the controller name, which you can change 
 - **Presets:** one button per saved preset. The button matching the current routing is highlighted.
 - **All → PC:** switch every output to one PC.
 - **Outputs:** switch each of the three outputs on its own. The current PC is highlighted.
+- **K/M:** move the keyboard and mouse to a PC. The current PC is highlighted. See [Moving the keyboard and mouse](#moving-the-keyboard-and-mouse).
 
 The routing display refreshes every 10 seconds.
 
@@ -151,7 +157,7 @@ Open it with the **Settings** button at the bottom of the main page, or go to `/
 - **General:**
   - **Controller name:** shown as the main page heading and the browser tab title. The default is "TESmart KVM".
   - **PC names:** rename PC1–PC4. The names appear on every button.
-  - **Presets:** add, edit and delete up to 8 presets. Each sets every output to a PC, or leaves it unchanged.
+  - **Presets:** add, edit and delete up to 8 presets. Each sets every output and the K/M to a PC, or leaves it unchanged. A preset's K/M PC must be on an output once the preset's outputs are set.
 - **Companion:** where to send state for Companion button feedback. See [Companion](#companion).
 - **Serial:** change the baud rate, send raw hex (with the checksum added automatically, if you choose), run the status query, and watch the log of the last 40 frames sent and received.
 - **Backup:**
@@ -179,20 +185,22 @@ Authorization: Bearer YOUR_TOKEN
 | `POST /api/preset/<n>` | Apply preset `n`, numbered from 1 in the order shown on the Settings page |
 | `POST /api/all/pc<1-4>` | Switch every output to one PC |
 | `POST /api/output/<1-3>/pc/<1-4>` | Switch one output |
-| `POST /api/query` | Send the manual's status query and return any raw reply as hex. The HDK403-P23 hasn't answered it. |
+| `POST /api/focus/pc<1-4>` | Move the keyboard and mouse to a PC. Returns 409 if the PC isn't on an output or the move fails. |
+| `POST /api/query` | Read the routing and K/M focus from the KVM, and return the raw replies as hex |
 
 Responses:
 
 ```json
 {"ok":true,"action":"preset-1","state":{
-  "version":"1.0.0","build":"...","uptime":1234,"title":"TESmart KVM","hostname":"kvm-controller","ip":"192.168.1.50","rssi":-60,
+  "version":"1.1.0","build":"...","uptime":1234,"title":"TESmart KVM","hostname":"kvm-controller","ip":"192.168.1.50","rssi":-60,
   "pcs":["PC1","PC2","PC3","PC4"],
-  "presets":[{"name":"My preset","outputs":[1,1,2]}],
+  "presets":[{"name":"My preset","outputs":[1,1,2],"focus":1}],
   "activePreset":1,
+  "focus":1,
   "outputs":{"1":1,"2":1,"3":2}}}
 ```
 
-`/api/status` returns `{"ok":true,"state":{...}}`. In `outputs`, `0` means unknown. Otherwise the value is the PC number. In a preset's `outputs`, `0` means "leave unchanged". `activePreset` is the number of the first preset matching the current routing, or `0` if none does. Errors return `{"ok":false,"error":"..."}` with a 4xx or 5xx status.
+`/api/status` returns `{"ok":true,"state":{...}}`. In `outputs`, `0` means unknown. Otherwise the value is the PC number. The top-level `focus` is the PC with the keyboard and mouse, or `0` if unknown. In a preset's `outputs` and `focus`, `0` means "leave unchanged". `activePreset` is the number of the first preset matching the current routing and K/M focus, or `0` if none does. Errors return `{"ok":false,"error":"..."}` with a 4xx or 5xx status.
 
 Deleting a preset renumbers the presets after it, so update any Companion buttons that point at those numbers.
 
@@ -203,10 +211,11 @@ Deleting a preset renumbers the presets after it, so update any Companion button
 - `http://kvm-controller.local/api/preset/1`
 - `http://kvm-controller.local/api/all/pc2`
 - `http://kvm-controller.local/api/output/3/pc/1`
+- `http://kvm-controller.local/api/focus/pc2`
 
 **Feedback:** the controller pushes its routing state into Companion custom variables through Companion's HTTP API. This covers changes made from the front panel, so buttons stay in sync without polling.
 
-1. In Companion, go to **Variables → Custom variables** and create `kvm_out1`, `kvm_out2`, `kvm_out3` and `kvm_preset`.
+1. In Companion, go to **Variables → Custom variables** and create `kvm_out1`, `kvm_out2`, `kvm_out3`, `kvm_preset` and `kvm_focus`.
 2. On the controller's Settings page, in the **Companion** tab, enter Companion's IP address and port (8000 by default), then click **Save** and **Send now**. The status line shows whether it worked, and names any variable that's missing.
 3. On a Companion button, add the internal **Variable: Check value** feedback. For example, highlight the button when `$(custom:kvm_out1)` equals `2`.
 
@@ -218,6 +227,7 @@ What the variables hold:
 |---|---|
 | `kvm_out1`–`kvm_out3` | PC number on each output (`0` = unknown) |
 | `kvm_preset` | Number of the matching preset (`0` = none) |
+| `kvm_focus` | PC number with the keyboard and mouse (`0` = unknown) |
 
 The controller sends a variable as soon as its value changes, and resends all of them every 60 seconds in case Companion restarted. Each request times out after 500 ms, and after a failure the controller waits 10 seconds before trying again. Use an IP address for Companion, because `.local` names don't resolve from the ESP32.
 
@@ -228,14 +238,14 @@ The built-in pages use `/ui/*` with the web login instead of the token. Every `/
 | Endpoint | Form fields |
 |---|---|
 | `POST /ui/config/pcs` | `pc1`–`pc4`. A blank name resets to the default. |
-| `POST /ui/config/preset/save` | `index` (0 for new), `name`, `o1`–`o3` (0–4) |
+| `POST /ui/config/preset/save` | `index` (0 for new), `name`, `o1`–`o3` (0–4), `focus` (0–4) |
 | `POST /ui/config/preset/delete` | `index` |
 | `POST /ui/config/title` | `title` (up to 32 bytes). A blank title resets to the default. |
 | `POST /ui/config/companion` | `companionHost` (blank turns feedback off), `companionPort`, `companionPrefix` |
 | `GET /ui/companion` | None. Returns the Companion settings and the result of the last send. |
 | `POST /ui/companion/test` | None. Sends every variable now and returns the result. |
 | `GET /ui/config/export` | Downloads the settings JSON |
-| `POST /ui/config/import` | `baud`, `title`, `pc1`–`pc4`, the Companion fields, `presets` (the count), then `p<n>name` and `p<n>o1`–`p<n>o3` for each preset. All fields are validated before anything is saved. |
+| `POST /ui/config/import` | `baud`, `title`, `pc1`–`pc4`, the Companion fields, `presets` (the count), then `p<n>name`, `p<n>o1`–`p<n>o3` and `p<n>focus` for each preset. All fields are validated before anything is saved. |
 | `POST /ui/config/reset` | None. Factory reset, then restart. |
 | `POST /ui/serial/send` | `hex` (up to 64 bytes) and `checksum=1` to append the checksum. Returns any reply received within 120 ms. |
 | `POST /ui/serial/baud` | `baud`: 9600, 19200, 38400, 57600 or 115200 |
@@ -251,22 +261,38 @@ The built-in pages use `/ui/*` with the web login instead of the token. Every `/
 
 ## Routing state
 
-The controller doesn't read the routing back from the KVM. The status query never gets an answer. Instead it tracks state from two sources:
+The controller reads its state back from the KVM:
 
-- **Its own commands:** every switch it sends updates the state.
-- **Front-panel reports:** the KVM reports input button presses, and the controller picks them up.
+- **Its own commands:** every switch it sends updates the state, and presets and K/M moves read the routing back and resend any switch that didn't take.
+- **K/M reports:** the KVM reports when the keyboard and mouse move, and the controller picks this up straight away.
+- **Polling:** every 5 seconds, it asks for either K/M focus or routing, in turn. Each is refreshed about every 10 seconds, including after a change at the KVM.
 
-Changes made with the IR remote or keyboard hotkeys haven't been tested, and may not be reported. Until the next switch, the page may show stale routing after such a change. State is saved in flash, so it survives restarts. A factory reset clears it.
+Changes made with the IR remote or keyboard hotkeys haven't been tested specifically. Routing is saved in flash, so it's available right after a restart, and polling then corrects it if the KVM has changed. A factory reset clears it.
+
+## Moving the keyboard and mouse
+
+No direct command to move the keyboard and mouse has been found on the HDK403-P23. The KVM does move them when the PC they're on leaves every monitor, and they stay put when that PC comes back. The controller uses that behaviour:
+
+1. It switches the monitors showing the current K/M PC to the target PC.
+2. It waits for the KVM to report the move. If that doesn't work, it switches every monitor to the target PC.
+3. It puts the monitors back and checks them.
+
+So those monitors change briefly during a move. The target PC must already be on a monitor, or the request is refused.
 
 ## HDK403-P23 serial protocol (as observed)
 
-TESmart's published UART table for its 2-PC model doesn't match the HDK403-P23. Here's what has been confirmed on this unit:
+TESmart's published UART table for its 2-PC model doesn't match the HDK403-P23. Here's what has been observed on this unit:
 
 - 9600 baud, 8N1
-- Frames are `AA BB <type> <arg1> <arg2> <checksum>`. The checksum is the low byte of the sum of the first five bytes. Frames ending in `EE`, as the manual shows, are ignored.
+- **Commands:** `AA BB <type> <arg1> <arg2> <checksum>`. The checksum is the low byte of the sum of the first five bytes. Frames ending in `EE`, as the manual shows, are ignored.
+- **Replies and reports:** `AA BB <type> <length> <data...> <checksum>`. The checksum covers everything before it.
+- **Queries:** `AA BB <type> 00 FF <checksum>`.
 - **Switching:** `AA BB 03 <output> <pc> <sum>`. `output` is 1–3, or `00` for all outputs. `pc` counts from 0, so `00` is PC1. Confirmed for each output with PC1 and PC2, and for all outputs with all four PCs. A single output to PC3 or PC4 hasn't been tested yet.
-- **Front-panel report:** the KVM sends `AA BB 82 01 <pc> <sum>` when an input button is pressed. Confirmed for all four inputs. It sometimes sends the same frame in response to a switch command, so the firmware ignores reports for 1 second after sending a switch.
-- **Not working:** the status query (`06 02 03`) never gets a reply. The buzzer toggle (`04 02 xx`) does nothing, and changing the buzzer setting in the KVM's menu sends nothing over serial.
+- **K/M focus (`82`):** `AA BB 82 01 <pc> <sum>`, sent in reply to a query and on its own when the focus moves. `pc` counts from 0.
+- **Routing (`83`):** `AA BB 83 06 01 <pc> 02 <pc> 03 <pc> <sum>`, one output and PC pair for each output. Routing reports received within 1 second of a switch are ignored while the KVM settles.
+- **Other queries:** `81` returned `43`, which fits 4 PCs and 3 monitors. `84` returned `00`, `88` returned `01` and `89` returned `0F 00`, and their meanings are unconfirmed. `85`, `86`, `8B`, `8C`, `8E` and `90` gave no reply.
+- **Not working:** the older status query (`06 02 03`) never gets a reply. The buzzer toggle (`04 02 xx`) does nothing, and changing the buzzer setting in the KVM's menu sends nothing over serial. `02 00 01`, `02 01 01`, `03 04 01` and `03 05 01` didn't set K/M focus.
+- **Pacing:** rapid switching can hang the KVM's serial port until it's power-cycled, and a switch sent while the K/M focus is moving can be dropped. The firmware leaves at least 250 ms after a switch before transmitting again, including for raw sends from the Serial tab.
 
 ## Project layout
 

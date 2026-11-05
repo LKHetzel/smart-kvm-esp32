@@ -18,7 +18,7 @@
 static const char* HOSTNAME = "kvm-controller";
 
 // Bump on each release; shown in the web pages, /status and the serial log.
-static const char* FW_VERSION = "1.0.0";
+static const char* FW_VERSION = "1.1.0";
 static const char* FW_BUILD = __DATE__ " " __TIME__;
 
 // ESP32 UART2 pins. These go to the TRRS terminal adapter.
@@ -34,7 +34,10 @@ static constexpr uint32_t DEFAULT_KVM_BAUD = 9600; // confirmed on the HDK403-P2
 static constexpr uint32_t SUPPORTED_BAUDS[] = {9600, 19200, 38400, 57600, 115200};
 
 static constexpr uint16_t HTTP_PORT = 80;
-static constexpr uint32_t COMMAND_GAP_MS = 100;
+// Minimum time between a switch and whatever is sent next. Rapid switching has hung the KVM's
+// serial port until it was power-cycled, so every transmission is paced (see waitForKvmIdle).
+static constexpr uint32_t COMMAND_GAP_MS = 250;
+static constexpr uint32_t KVM_IDLE_MAX_MS = 500; // give up waiting for a quiet line after this long
 
 // How long to wait for a reply after a query or raw send.
 static constexpr uint32_t REPLY_WAIT_MS = 120;
@@ -79,11 +82,20 @@ struct RoutingState {
 };
 
 RoutingState state;
+static RoutingState kvmRoutes; // last routing the KVM reported, used to check that switches took effect
+static uint8_t kmFocus = 0; // PC with the keyboard and mouse: 0 unknown, 1-4 PC number. Read from the KVM.
 
-// Stored as a raw NVS blob: changing this layout means changing the "presets" key too.
+// Stored as a raw NVS blob: changing this layout means changing the "presets2" key too.
 struct Preset {
   char name[NAME_MAX_LEN + 1];
   uint8_t outputs[3]; // per output: 0 leave unchanged, 1-4 PC number
+  uint8_t focus;      // keyboard and mouse: 0 leave unchanged, 1-4 PC number
+};
+
+// Layout of the older "presets" key, read once to migrate it.
+struct PresetV1 {
+  char name[NAME_MAX_LEN + 1];
+  uint8_t outputs[3];
 };
 
 static Preset presets[MAX_PRESETS];
@@ -98,26 +110,32 @@ struct CompanionConfig {
 };
 
 static CompanionConfig companion;
-static const char* COMPANION_VARS[] = {"out1", "out2", "out3", "preset"};
-static int companionPushed[4] = {-1, -1, -1, -1}; // last values Companion accepted; -1 forces a push
+static constexpr size_t COMPANION_VAR_COUNT = 5;
+static const char* COMPANION_VARS[COMPANION_VAR_COUNT] = {"out1", "out2", "out3", "preset", "focus"};
+static int companionPushed[COMPANION_VAR_COUNT] = {-1, -1, -1, -1, -1}; // last values Companion accepted; -1 forces a push
 static uint32_t companionRetryAt = 0;
 static uint32_t companionSyncedAt = 0;
 static String companionResult = "Not configured";
 static uint32_t kvmBaud = DEFAULT_KVM_BAUD;
 static bool wifiWasConnected = false;
 
-// TESmart frames: AA BB <type> <arg1> <arg2> <checksum>, where checksum is the low byte of the
-// sum of the first five bytes. The 2-PC model's manual shows EE in place of the checksum, but the
+// TESmart commands: AA BB <type> <arg1> <arg2> <checksum>, where checksum is the low byte of the
+// sum of the earlier bytes. The 2-PC model's manual shows EE in place of the checksum, but the
 // HDK403-P23 ignores those frames and reports in the checksum form itself.
+// Replies and reports: AA BB <type> <length> <data...> <checksum>.
 static constexpr uint8_t KVM_SWITCH = 0x03;        // arg1 output 1-3 (0 = all), arg2 PC (0-based). Verified.
-static constexpr uint8_t KVM_QUERY = 0x06;         // arg1 0x02, arg2 0x03. Never answered on the HDK403-P23.
 // The manual's buzzer toggle (04 02 xx) does nothing on the HDK403-P23, with or without checksum.
-static constexpr uint8_t KVM_SWITCH_REPORT = 0x82; // sent by the KVM on front-panel switching: arg1 0x01, arg2 PC (0-based). Verified.
+// Queries are sent with arg1 0x00, arg2 0xFF.
+static constexpr uint8_t KVM_FOCUS_REPORT = 0x82;  // data: PC with the keyboard and mouse (0-based). Also sent unprompted when it moves. Verified.
+static constexpr uint8_t KVM_ROUTE_REPORT = 0x83;  // data: <output 1-3> <PC (0-based)> pairs. Verified.
 static constexpr size_t KVM_FRAME_LEN = 6;
-// The KVM sometimes echoes a switch report for our own commands. Reports this soon after we
-// send a switch are ignored so they can't overwrite the state the command just set.
-static constexpr uint32_t KVM_ECHO_IGNORE_MS = 1000;
+static constexpr size_t KVM_RX_MAX_FRAME = 24;
+// A route reply this soon after we send a switch may predate it, so it's ignored.
+static constexpr uint32_t KVM_SETTLE_MS = 1000;
+static constexpr uint32_t KVM_POLL_MS = 5000; // one query per tick, alternating focus and routing
 static uint32_t lastSwitchTxMs = 0;
+static uint32_t lastPollMs = 0;
+static uint8_t pollAwaiting = 0; // type of the background query in flight; its reply stays out of the log
 
 // ---------------------------
 // Auth
@@ -186,7 +204,22 @@ static void loadState() {
 
 static void savePresets() {
   prefs.putUChar("presetCount", presetCount);
-  if (presetCount) prefs.putBytes("presets", presets, presetCount * sizeof(Preset));
+  if (presetCount) prefs.putBytes("presets2", presets, presetCount * sizeof(Preset));
+  if (prefs.isKey("presets")) prefs.remove("presets");
+}
+
+// Reads presetCount presets, converting the older layout if that's what is stored.
+static bool loadPresets() {
+  if (prefs.isKey("presets2")) {
+    return prefs.getBytes("presets2", presets, presetCount * sizeof(Preset)) == presetCount * sizeof(Preset);
+  }
+  PresetV1 old[MAX_PRESETS];
+  if (prefs.getBytes("presets", old, presetCount * sizeof(PresetV1)) != presetCount * sizeof(PresetV1)) return false;
+  for (size_t i = 0; i < presetCount; i++) {
+    memcpy(&presets[i], &old[i], sizeof(PresetV1));
+    presets[i].focus = 0;
+  }
+  return true;
 }
 
 static void loadConfig() {
@@ -202,10 +235,7 @@ static void loadConfig() {
 
   if (prefs.isKey("presetCount")) {
     presetCount = prefs.getUChar("presetCount", 0);
-    if (presetCount <= MAX_PRESETS &&
-        (presetCount == 0 || prefs.getBytes("presets", presets, presetCount * sizeof(Preset)) == presetCount * sizeof(Preset))) {
-      return;
-    }
+    if (presetCount <= MAX_PRESETS && (presetCount == 0 || loadPresets())) return;
   }
   // First boot (or unreadable data): no presets until they're added on the Settings page.
   presetCount = 0;
@@ -287,27 +317,51 @@ static uint8_t kvmChecksum(const uint8_t* data, size_t len) {
   return sum;
 }
 
-// Updates state from a frame the KVM sent. So far only the front-panel switch report is known.
+// Updates state from a frame the KVM sent.
 static void handleKvmFrame(const uint8_t* f) {
-  if (f[2] == KVM_SWITCH_REPORT && f[3] == 0x01 && f[4] < NUM_PCS) {
-    // Seen when pressing an input button in display mode 1, which switches every output.
-    if (millis() - lastSwitchTxMs < KVM_ECHO_IGNORE_MS) return;
-    uint8_t pc = f[4] + 1;
-    state = {pc, pc, pc};
+  const uint8_t type = f[2];
+  const uint8_t len = f[3];
+  const uint8_t* data = f + 4;
+  if (type == KVM_FOCUS_REPORT && len == 1 && data[0] < NUM_PCS) {
+    kmFocus = data[0] + 1;
+  } else if (type == KVM_ROUTE_REPORT && len % 2 == 0) {
+    for (uint8_t i = 0; i < len; i += 2) {
+      uint8_t pc = data[i + 1];
+      if (pc >= NUM_PCS) return;
+      if (data[i] == 1) kvmRoutes.output1 = pc + 1;
+      else if (data[i] == 2) kvmRoutes.output2 = pc + 1;
+      else if (data[i] == 3) kvmRoutes.output3 = pc + 1;
+      else return;
+    }
+    if (millis() - lastSwitchTxMs < KVM_SETTLE_MS) return;
+    if (!kvmRoutes.output1 || !kvmRoutes.output2 || !kvmRoutes.output3) return;
+    if (memcmp(&kvmRoutes, &state, sizeof(state)) == 0) return;
+    state = kvmRoutes;
     persistState();
-    Serial.printf("KVM reports all outputs on PC%u\n", pc);
+    Serial.printf("KVM reports outputs on PC%u, PC%u, PC%u\n", state.output1, state.output2, state.output3);
   }
 }
 
-// Feeds received bytes through a sliding window and handles each valid frame.
-static void onKvmByte(uint8_t b) {
-  static uint8_t frame[KVM_FRAME_LEN];
-  memmove(frame, frame + 1, KVM_FRAME_LEN - 1);
-  frame[KVM_FRAME_LEN - 1] = b;
-  if (frame[0] == 0xAA && frame[1] == 0xBB && frame[5] == kvmChecksum(frame, 5)) {
-    handleKvmFrame(frame);
-    memset(frame, 0, sizeof(frame));
+// Assembles received bytes into frames and handles each valid one. Returns the type of the
+// frame this byte completed, or 0.
+static uint8_t onKvmByte(uint8_t b) {
+  static uint8_t frame[KVM_RX_MAX_FRAME];
+  static size_t n = 0;
+  if (n == 0 && b != 0xAA) return 0;
+  if (n == 1 && b != 0xBB) {
+    n = b == 0xAA ? 1 : 0;
+    return 0;
   }
+  if (n == 3 && b > KVM_RX_MAX_FRAME - 5) {
+    n = 0;
+    return 0;
+  }
+  frame[n++] = b;
+  if (n < 5 || n < 5u + frame[3]) return 0;
+  n = 0;
+  if (b != kvmChecksum(frame, 4 + frame[3])) return 0;
+  handleKvmFrame(frame);
+  return frame[2];
 }
 
 // Collects bytes the KVM sends on its own, logging each burst once the line goes quiet.
@@ -315,18 +369,36 @@ static void pollSerial() {
   while (KvmSerial.available()) {
     uint8_t b = KvmSerial.read();
     appendHex(pendingRx, b);
-    onKvmByte(b);
+    uint8_t type = onKvmByte(b);
+    if (type && type == pollAwaiting) {
+      pendingRx = "";
+      pollAwaiting = 0;
+    }
     lastRxMs = millis();
   }
   if (pendingRx.length() && millis() - lastRxMs > RX_GAP_MS) flushPendingRx();
 }
 
+// Holds off until the KVM has finished sending and the last switch has had time to take effect.
+static void waitForKvmIdle() {
+  uint32_t start = millis();
+  while (millis() - start < KVM_IDLE_MAX_MS) {
+    pollSerial();
+    uint32_t now = millis();
+    bool replyDue = pollAwaiting && now - lastPollMs < REPLY_WAIT_MS;
+    if (!replyDue && now - lastSwitchTxMs >= COMMAND_GAP_MS && now - lastRxMs >= RX_GAP_MS) return;
+    delay(1);
+  }
+}
+
 static void sendCommand(const uint8_t* data, size_t len) {
+  waitForKvmIdle();
   // Log anything already received first so the log stays in order.
-  pollSerial();
   flushPendingRx();
+  pollAwaiting = 0;
   KvmSerial.write(data, len);
   KvmSerial.flush();
+  if (len > 2 && data[2] == KVM_SWITCH) lastSwitchTxMs = millis();
   logSerial(true, toHex(data, len));
 }
 
@@ -348,7 +420,29 @@ static void sendKvm(uint8_t type, uint8_t arg1, uint8_t arg2) {
   uint8_t f[KVM_FRAME_LEN] = {0xAA, 0xBB, type, arg1, arg2, 0};
   f[5] = kvmChecksum(f, 5);
   sendCommand(f, sizeof(f));
-  if (type == KVM_SWITCH) lastSwitchTxMs = millis();
+}
+
+// Sends a query and waits for the reply, which updates the state. Returns the reply as hex.
+static String queryKvm(uint8_t type) {
+  uint8_t f[KVM_FRAME_LEN] = {0xAA, 0xBB, type, 0x00, 0xFF, 0};
+  f[5] = kvmChecksum(f, 5);
+  return sendAndReadReply(f, sizeof(f));
+}
+
+// Keeps the state in step with changes made at the KVM. Sent without logging: the log would
+// otherwise fill up with these. A reply that arrives later is handled by pollSerial().
+static void pollKvmState() {
+  static bool routeNext = false;
+  uint32_t now = millis();
+  if (now - lastPollMs < KVM_POLL_MS || now - lastSwitchTxMs < KVM_SETTLE_MS ||
+      now - lastRxMs < RX_GAP_MS || pendingRx.length()) return;
+  lastPollMs = now;
+  uint8_t type = routeNext ? KVM_ROUTE_REPORT : KVM_FOCUS_REPORT;
+  routeNext = !routeNext;
+  uint8_t f[KVM_FRAME_LEN] = {0xAA, 0xBB, type, 0x00, 0xFF, 0};
+  f[5] = kvmChecksum(f, 5);
+  pollAwaiting = type;
+  KvmSerial.write(f, sizeof(f));
 }
 
 static bool routeOutput(uint8_t output, uint8_t pc) {
@@ -363,7 +457,68 @@ static bool routeOutput(uint8_t output, uint8_t pc) {
   return true;
 }
 
-// 1-based number of the first preset whose routed outputs all match the current state, or 0.
+static bool waitForFocus(uint8_t pc) {
+  for (int i = 0; i < 5; i++) {
+    queryKvm(KVM_FOCUS_REPORT);
+    if (kmFocus == pc) return true;
+    delay(COMMAND_GAP_MS);
+  }
+  return false;
+}
+
+// The KVM can drop a switch that arrives while the keyboard and mouse are moving, so read the
+// routing back and resend whatever didn't take. Passes if the KVM doesn't answer, as there's
+// nothing to check against.
+static bool confirmRouting() {
+  const uint8_t want[3] = {state.output1, state.output2, state.output3};
+  for (int i = 0; i < 4; i++) {
+    kvmRoutes = RoutingState();
+    queryKvm(KVM_ROUTE_REPORT);
+    const uint8_t got[3] = {kvmRoutes.output1, kvmRoutes.output2, kvmRoutes.output3};
+    if (!got[0] || !got[1] || !got[2]) return true;
+    bool match = true;
+    for (uint8_t o = 0; o < 3; o++) {
+      if (got[o] == want[o]) continue;
+      match = false;
+      sendKvm(KVM_SWITCH, o + 1, want[o] - 1);
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+// No command to set the keyboard and mouse is known. The KVM moves them itself when the PC they're
+// on leaves every monitor, and they stay put when that PC comes back. So: briefly switch the
+// monitors showing the current PC to the target, wait for the move, then put them back. If that
+// doesn't land, switch every monitor to the target instead. Returns an error message, or "" on success.
+static String moveFocus(uint8_t pc) {
+  queryKvm(KVM_ROUTE_REPORT);
+  queryKvm(KVM_FOCUS_REPORT);
+  if (kmFocus == pc) return "";
+
+  const uint8_t current[3] = {state.output1, state.output2, state.output3};
+  if (!current[0] || !current[1] || !current[2]) return "routing is not known yet";
+  if (current[0] != pc && current[1] != pc && current[2] != pc) {
+    return "PC" + String(pc) + " is not on any output, and the keyboard and mouse can only move to a PC on screen";
+  }
+
+  const uint8_t from = kmFocus;
+  for (uint8_t o = 0; o < 3; o++) {
+    if (current[o] != from) continue;
+    sendKvm(KVM_SWITCH, o + 1, pc - 1);
+  }
+  bool moved = waitForFocus(pc);
+  if (!moved) {
+    sendKvm(KVM_SWITCH, 0x00, pc - 1);
+    moved = waitForFocus(pc);
+  }
+  // Everything the moves above changed gets put back here.
+  if (!confirmRouting()) return "the outputs did not return to their PCs";
+  if (!moved || !waitForFocus(pc)) return "the keyboard and mouse did not move to PC" + String(pc);
+  return "";
+}
+
+// 1-based number of the first preset whose outputs and keyboard/mouse all match the current state, or 0.
 static int activePreset() {
   const uint8_t current[3] = {state.output1, state.output2, state.output3};
   for (size_t i = 0; i < presetCount; i++) {
@@ -371,19 +526,23 @@ static int activePreset() {
     for (int o = 0; o < 3; o++) {
       if (presets[i].outputs[o] && presets[i].outputs[o] != current[o]) match = false;
     }
+    if (presets[i].focus && presets[i].focus != kmFocus) match = false;
     if (match) return i + 1;
   }
   return 0;
 }
 
-static void applyPreset(const Preset& p) {
-  bool first = true;
+// Returns an error message, or "" on success.
+static String applyPreset(const Preset& p) {
+  bool routed = false;
   for (uint8_t o = 0; o < 3; o++) {
     if (!p.outputs[o]) continue;
-    if (!first) delay(COMMAND_GAP_MS);
     routeOutput(o + 1, p.outputs[o]);
-    first = false;
+    routed = true;
   }
+  if (routed && !confirmRouting()) return "some outputs did not switch";
+  if (!p.focus) return "";
+  return moveFocus(p.focus);
 }
 
 // ---------------------------
@@ -431,8 +590,8 @@ static bool pushCompanionVariable(const char* name, int value) {
 
 // Pushes changed values (or all of them when full is set). Returns false on the first failure.
 static bool syncCompanion(bool full) {
-  int values[4] = {state.output1, state.output2, state.output3, activePreset()};
-  for (int i = 0; i < 4; i++) {
+  int values[COMPANION_VAR_COUNT] = {state.output1, state.output2, state.output3, activePreset(), kmFocus};
+  for (size_t i = 0; i < COMPANION_VAR_COUNT; i++) {
     if (!full && values[i] == companionPushed[i]) continue;
     if (!pushCompanionVariable(COMPANION_VARS[i], values[i])) return false;
     companionPushed[i] = values[i];
@@ -447,9 +606,9 @@ static void companionLoop() {
   if ((int32_t)(now - companionRetryAt) < 0) return;
 
   bool full = companionSyncedAt == 0 || now - companionSyncedAt > COMPANION_RESYNC_MS;
-  int values[4] = {state.output1, state.output2, state.output3, activePreset()};
+  int values[COMPANION_VAR_COUNT] = {state.output1, state.output2, state.output3, activePreset(), kmFocus};
   bool changed = false;
-  for (int i = 0; i < 4; i++) changed |= values[i] != companionPushed[i];
+  for (size_t i = 0; i < COMPANION_VAR_COUNT; i++) changed |= values[i] != companionPushed[i];
   if (!full && !changed) return;
 
   if (syncCompanion(full)) {
@@ -525,10 +684,11 @@ static String stateJson() {
     const Preset& p = presets[i];
     if (i) json += ',';
     json += "{\"name\":" + jsonString(p.name) + ",\"outputs\":[" + String(p.outputs[0]) + "," +
-            String(p.outputs[1]) + "," + String(p.outputs[2]) + "]}";
+            String(p.outputs[1]) + "," + String(p.outputs[2]) + "],\"focus\":" + String(p.focus) + "}";
   }
   json += "],";
   json += "\"activePreset\":" + String(activePreset()) + ",";
+  json += "\"focus\":" + String(kmFocus) + ",";
   json += "\"outputs\":{";
   json += "\"1\":" + String(state.output1) + ",";
   json += "\"2\":" + String(state.output2) + ",";
@@ -559,7 +719,11 @@ static void handlePresetApply(const char* path) {
     sendJsonError(404, "no such preset");
     return;
   }
-  applyPreset(presets[n - 1]);
+  String error = applyPreset(presets[n - 1]);
+  if (error.length()) {
+    sendJsonError(409, "outputs switched, but " + error);
+    return;
+  }
   sendJsonOk(("preset-" + String(n)).c_str());
 }
 
@@ -580,7 +744,7 @@ static void savePcNamesFromArgs() {
   }
 }
 
-// Reads a preset from form fields <prefix>name and <prefix>o1..o3. Returns an error message, or "" if valid.
+// Reads a preset from form fields <prefix>name, <prefix>o1..o3 and <prefix>focus. Returns an error message, or "" if valid.
 static String presetFromArgs(const String& prefix, Preset& out) {
   String name = cleanName(server.arg(prefix + "name"));
   if (!name.length()) return "preset needs a name";
@@ -591,7 +755,14 @@ static String presetFromArgs(const String& prefix, Preset& out) {
     out.outputs[o] = v;
     any |= v != 0;
   }
-  if (!any) return "preset must route at least one output";
+  int focus = server.arg(prefix + "focus").toInt();
+  if (focus < 0 || focus > NUM_PCS) return "keyboard and mouse must be 0 (unchanged) or a PC number 1-4";
+  if (focus && out.outputs[0] && out.outputs[1] && out.outputs[2] && out.outputs[0] != focus &&
+      out.outputs[1] != focus && out.outputs[2] != focus) {
+    return "keyboard and mouse must be on a PC this preset puts on an output";
+  }
+  out.focus = focus;
+  if (!any && !focus) return "preset must route at least one output or the keyboard and mouse";
   strlcpy(out.name, name.c_str(), sizeof(out.name));
   return "";
 }
@@ -614,7 +785,7 @@ static void handleSavePcNames() {
   sendJsonOk("save-pc-names");
 }
 
-// POST index=<1-n, or 0 for new>&name=...&o1=&o2=&o3= (0 unchanged, 1-4 PC number)
+// POST index=<1-n, or 0 for new>&name=...&o1=&o2=&o3=&focus= (0 unchanged, 1-4 PC number)
 static void handleSavePreset() {
   int index = server.arg("index").toInt();
   Preset p;
@@ -685,14 +856,14 @@ static void handleExportConfig() {
     const Preset& p = presets[i];
     if (i) json += ',';
     json += "{\"name\":" + jsonString(p.name) + ",\"outputs\":[" + String(p.outputs[0]) + "," +
-            String(p.outputs[1]) + "," + String(p.outputs[2]) + "]}";
+            String(p.outputs[1]) + "," + String(p.outputs[2]) + "],\"focus\":" + String(p.focus) + "}";
   }
   json += "]}";
   server.sendHeader("Content-Disposition", String("attachment; filename=\"") + HOSTNAME + "-settings.json\"");
   server.send(200, "application/json", json);
 }
 
-// POST baud=&title=&pc1..pc4=&companionHost=&companionPort=&companionPrefix=&presets=<count>&p1name=&p1o1=..p1o3=&p2name=...
+// POST baud=&title=&pc1..pc4=&companionHost=&companionPort=&companionPrefix=&presets=<count>&p1name=&p1o1=..p1o3=&p1focus=&p2name=...
 // The page parses the exported JSON and sends it as form fields. Everything is validated before anything is saved.
 static void handleImportConfig() {
   uint32_t baud = server.arg("baud").toInt();
@@ -764,6 +935,7 @@ static void handleAllRoute(const char* path) {
   }
   sendKvm(KVM_SWITCH, 0x00, pc - 1);
   state = {(uint8_t)pc, (uint8_t)pc, (uint8_t)pc};
+  kmFocus = pc; // every other PC just left the monitors, so the keyboard and mouse follow
   persistState();
   sendJsonOk(("all-pc" + String(pc)).c_str());
 }
@@ -782,10 +954,28 @@ static void handleOutputRoute(const char* path) {
   sendJsonOk("route-output");
 }
 
+// path is the URI with the /api or /ui prefix removed: /focus/pc<1-4>
+static void handleFocusRoute(const char* path) {
+  int pc = 0;
+  int consumed = 0;
+  if (sscanf(path, "/focus/pc%d%n", &pc, &consumed) != 1 || path[consumed] != '\0' ||
+      pc < 1 || pc > NUM_PCS) {
+    sendJsonError(400, "bad route");
+    return;
+  }
+  String error = moveFocus(pc);
+  if (error.length()) {
+    sendJsonError(409, error);
+    return;
+  }
+  sendJsonOk(("focus-pc" + String(pc)).c_str());
+}
+
 static void handleQuery() {
-  uint8_t f[KVM_FRAME_LEN] = {0xAA, 0xBB, KVM_QUERY, 0x02, 0x03, 0};
-  f[5] = kvmChecksum(f, 5);
-  String hex = sendAndReadReply(f, sizeof(f));
+  String hex = queryKvm(KVM_ROUTE_REPORT);
+  String focusHex = queryKvm(KVM_FOCUS_REPORT);
+  if (hex.length() && focusHex.length()) hex += ' ';
+  hex += focusHex;
   server.send(200, "application/json", "{\"ok\":true,\"raw\":\"" + hex + "\"}");
 }
 
@@ -935,7 +1125,7 @@ static void setupRoutes() {
   addUiRoute("/serial/log", HTTP_GET, handleSerialLog);
   server.on("/ui/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
 
-  // Routes with path parameters (/output/<n>/pc/<n>, /all/pc<n>, /preset/<n>) are dispatched here.
+  // Routes with path parameters (/output/<n>/pc/<n>, /all/pc<n>, /focus/pc<n>, /preset/<n>) are dispatched here.
   server.onNotFound([](){
     const String& uri = server.uri();
     bool api = uri.startsWith("/api/");
@@ -944,11 +1134,13 @@ static void setupRoutes() {
     if (server.method() == HTTP_POST && path) {
       bool output = strncmp(path, "/output/", 8) == 0;
       bool all = strncmp(path, "/all/", 5) == 0;
+      bool focus = strncmp(path, "/focus/", 7) == 0;
       bool preset = strncmp(path, "/preset/", 8) == 0;
-      if (output || all || preset) {
+      if (output || all || focus || preset) {
         if (!(api ? requireAuth() : requireUiAuth())) return;
         if (output) handleOutputRoute(path);
         else if (all) handleAllRoute(path);
+        else if (focus) handleFocusRoute(path);
         else handlePresetApply(path);
         return;
       }
@@ -1026,6 +1218,7 @@ void setup() {
 void loop() {
   checkWifi();
   pollSerial();
+  pollKvmState();
   server.handleClient();
   companionLoop();
   delay(2);

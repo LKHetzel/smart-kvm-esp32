@@ -35,8 +35,8 @@
 
 <h2>Presets</h2>
 <div id="presetList"></div>
-<p><button onclick="$('presetList').append(presetCard({name: '', outputs: [0, 0, 0]}, 0))">Add preset</button></p>
-<p class="note">"Unchanged" leaves that output where it is. You can have up to 8 presets. Companion can trigger them with <code>POST /api/preset/&lt;number&gt;</code>, numbered from 1 in this order.</p>
+<p><button onclick="$('presetList').append(presetCard({name: '', outputs: [0, 0, 0], focus: 0}, 0))">Add preset</button></p>
+<p class="note">"Unchanged" leaves that output or the keyboard and mouse where they are. The keyboard and mouse can only go to a PC that's on an output. You can have up to 8 presets. Companion can trigger them with <code>POST /api/preset/&lt;number&gt;</code>, numbered from 1 in this order.</p>
 </section>
 
 <section data-tab="companion" hidden>
@@ -67,7 +67,7 @@
 <div class="grid">
   <button onclick="act('/ui/query')">Query status</button>
 </div>
-<p class="note">The baud rate is saved on the controller. With "Add checksum byte" ticked, the KVM's checksum (the low byte of the sum of all bytes) is added to the end. For example, <code>AA BB 03 01 01</code> becomes <code>AA BB 03 01 01 6A</code>. Replies, and anything the KVM sends by itself, show up in the log. The status query is from the manual, and this KVM hasn't answered it yet.</p>
+<p class="note">The baud rate is saved on the controller. With "Add checksum byte" ticked, the KVM's checksum (the low byte of the sum of all bytes) is added to the end. For example, <code>AA BB 03 01 01</code> becomes <code>AA BB 03 01 01 6A</code>. Replies, and anything the KVM sends by itself, show up in the log. The controller's own background status checks stay out of it. "Query status" asks the KVM for its routing and keyboard/mouse PC.</p>
 
 <h2>Serial log</h2>
 <pre id="log"></pre>
@@ -117,11 +117,14 @@ function presetCard(p, index) {
     s.value = p.outputs[o];
     return s;
   });
+  const focus = el('select', {}, ...['Unchanged', ...cfg.pcs].map((label, v) => el('option', {value: v, textContent: label})));
+  focus.value = p.focus || 0;
   const card = el('div', {className: 'card'},
     el('div', {className: 'field'}, name),
     ...selects.map((s, o) => el('div', {className: 'field'}, el('label', {textContent: 'Output ' + (o + 1)}), s)),
+    el('div', {className: 'field'}, el('label', {textContent: 'K/M'}), focus),
     el('div', {className: 'actions'},
-      el('button', {textContent: 'Save', onclick: () => savePreset(index, name.value, selects.map(s => s.value))}),
+      el('button', {textContent: 'Save', onclick: () => savePreset(index, name.value, selects.map(s => s.value), focus.value)}),
       index ? el('button', {textContent: 'Delete', onclick: () => deletePreset(index, p.name)})
             : el('button', {textContent: 'Cancel', onclick: () => card.remove()})));
   return card;
@@ -143,10 +146,10 @@ function savePcNames() {
   });
 }
 
-function savePreset(index, name, outs) {
+function savePreset(index, name, outs, focus) {
   return busy(async () => {
     const j = await req('/ui/config/preset/save', 'POST',
-                        new URLSearchParams({index, name, o1: outs[0], o2: outs[1], o3: outs[2]}));
+                        new URLSearchParams({index, name, o1: outs[0], o2: outs[1], o3: outs[2], focus}));
     loadConfig(j.state);
     say('Preset saved', true);
   });
@@ -168,7 +171,7 @@ function renderCompanion(j, fillInputs = true) {
     $('cmpPort').value = j.companion.port;
     $('cmpPrefix').value = j.companion.prefix;
   }
-  $('cmpVars').textContent = ['out1', 'out2', 'out3', 'preset'].map(v => j.companion.prefix + '_' + v).join(', ');
+  $('cmpVars').textContent = ['out1', 'out2', 'out3', 'preset', 'focus'].map(v => j.companion.prefix + '_' + v).join(', ');
   $('cmpResult').textContent = 'Status: ' + j.result;
 }
 
@@ -209,6 +212,7 @@ async function importSettings() {
   cfgFile.presets.forEach((p, i) => {
     params.set(`p${i + 1}name`, p.name);
     (p.outputs || []).forEach((v, o) => params.set(`p${i + 1}o${o + 1}`, v));
+    params.set(`p${i + 1}focus`, p.focus || 0);
   });
   return busy(async () => {
     const j = await req('/ui/config/import', 'POST', params);
